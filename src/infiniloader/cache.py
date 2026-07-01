@@ -1,0 +1,395 @@
+from __future__ import annotations
+
+import fnmatch
+import hashlib
+import json
+import os
+import shutil
+import stat
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Iterable
+
+
+DEFAULT_EXCLUDES = (
+    ".git/*",
+    "*/.git/*",
+    "__pycache__/*",
+    "*/__pycache__/*",
+    ".cache/*",
+    "*/.cache/*",
+    ".iloader-cache/*",
+    "*/.iloader-cache/*",
+    ".iloader/*",
+    "*/.iloader/*",
+    "*.lock",
+    "*.tmp",
+    "*.log",
+)
+
+ProgressFn = Callable[[int, int, Path], None]
+
+
+@dataclass
+class SourceFile:
+    path: Path
+    rel: Path
+    size: int
+    mode: int
+    mtime_ns: int
+
+    @property
+    def rel_posix(self) -> str:
+        return self.rel.as_posix()
+
+
+@dataclass
+class CachedFile:
+    source: SourceFile
+    fd: int
+    digest_prefix: str
+
+    @property
+    def proc_path(self) -> str:
+        return f"/proc/{os.getpid()}/fd/{self.fd}"
+
+    def close(self) -> None:
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+@dataclass
+class CachedModel:
+    source_root: Path
+    files: list[CachedFile]
+    total_bytes: int
+    loaded_at: float = field(default_factory=time.time)
+    include_patterns: tuple[str, ...] = ()
+    exclude_patterns: tuple[str, ...] = DEFAULT_EXCLUDES
+    workers: int = 1
+
+    def close(self) -> None:
+        for item in self.files:
+            item.close()
+
+    def to_manifest(self, view_path: Path | None = None) -> dict:
+        return {
+            "format_version": 1,
+            "daemon_pid": os.getpid(),
+            "source_root": str(self.source_root),
+            "view_path": str(view_path) if view_path else None,
+            "loaded_at": self.loaded_at,
+            "file_count": len(self.files),
+            "total_bytes": self.total_bytes,
+            "include_patterns": list(self.include_patterns),
+            "exclude_patterns": list(self.exclude_patterns),
+            "workers": self.workers,
+            "files": [
+                {
+                    "relative_path": item.source.rel_posix,
+                    "size": item.source.size,
+                    "source_mtime_ns": item.source.mtime_ns,
+                    "memfd": item.proc_path,
+                    "digest_prefix": item.digest_prefix,
+                }
+                for item in self.files
+            ],
+        }
+
+
+def human_bytes(value: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            return f"{amount:.2f} {unit}" if unit != "B" else f"{int(amount)} B"
+        amount /= 1024
+    return f"{value} B"
+
+
+def available_memory_bytes() -> int | None:
+    meminfo = Path("/proc/meminfo")
+    try:
+        for line in meminfo.read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except OSError:
+        return None
+    return None
+
+
+def _matches_any(rel: str, patterns: Iterable[str]) -> bool:
+    return any(fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(Path(rel).name, pattern) for pattern in patterns)
+
+
+def should_include(rel: Path, include_patterns: tuple[str, ...], exclude_patterns: tuple[str, ...]) -> bool:
+    rel_text = rel.as_posix()
+    if include_patterns and not _matches_any(rel_text, include_patterns):
+        return False
+    if exclude_patterns and _matches_any(rel_text, exclude_patterns):
+        return False
+    return True
+
+
+def collect_source_files(
+    source_root: Path,
+    include_patterns: tuple[str, ...] = (),
+    exclude_patterns: tuple[str, ...] = DEFAULT_EXCLUDES,
+) -> list[SourceFile]:
+    source_root = source_root.expanduser().resolve()
+    if not source_root.exists():
+        raise FileNotFoundError(source_root)
+    if not source_root.is_dir():
+        raise NotADirectoryError(f"expected a model directory, got {source_root}")
+
+    files: list[SourceFile] = []
+    for path in sorted(source_root.rglob("*")):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        rel = path.relative_to(source_root)
+        if not should_include(rel, include_patterns, exclude_patterns):
+            continue
+        files.append(SourceFile(path=path, rel=rel, size=st.st_size, mode=st.st_mode, mtime_ns=st.st_mtime_ns))
+    return files
+
+
+def inspect_source(
+    source_root: Path,
+    include_patterns: tuple[str, ...] = (),
+    exclude_patterns: tuple[str, ...] = DEFAULT_EXCLUDES,
+) -> dict:
+    files = collect_source_files(source_root, include_patterns, exclude_patterns)
+    total = sum(item.size for item in files)
+    by_suffix: dict[str, dict[str, int]] = {}
+    for item in files:
+        suffix = item.path.suffix or "<none>"
+        bucket = by_suffix.setdefault(suffix, {"count": 0, "bytes": 0})
+        bucket["count"] += 1
+        bucket["bytes"] += item.size
+    return {
+        "source_root": str(Path(source_root).expanduser().resolve()),
+        "file_count": len(files),
+        "total_bytes": total,
+        "total_human": human_bytes(total),
+        "available_memory_bytes": available_memory_bytes(),
+        "by_suffix": by_suffix,
+    }
+
+
+def _memfd_name(rel: Path) -> str:
+    rel_text = rel.as_posix()
+    digest = hashlib.sha1(rel_text.encode("utf-8")).hexdigest()[:12]
+    stem = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in rel.name)
+    return f"infiniloader-{digest}-{stem[:80]}"
+
+
+def _copy_with_copy_file_range(src_fd: int, dst_fd: int, size: int, chunk_size: int) -> int:
+    copy_file_range = getattr(os, "copy_file_range", None)
+    if copy_file_range is None:
+        raise OSError("copy_file_range is not available")
+    copied = 0
+    while copied < size:
+        count = min(chunk_size, size - copied)
+        sent = copy_file_range(src_fd, dst_fd, count)
+        if sent == 0:
+            break
+        copied += sent
+    return copied
+
+
+def _copy_with_read_write(src_fd: int, dst_fd: int, size: int, chunk_size: int) -> int:
+    copied = 0
+    while True:
+        data = os.read(src_fd, min(chunk_size, max(size - copied, 1)))
+        if not data:
+            break
+        view = memoryview(data)
+        while view:
+            written = os.write(dst_fd, view)
+            view = view[written:]
+        copied += len(data)
+    return copied
+
+
+def copy_file_to_memfd(source: SourceFile, chunk_size: int = 64 * 1024 * 1024) -> CachedFile:
+    if not hasattr(os, "memfd_create"):
+        raise RuntimeError("memfd_create is not available; InfiniLoader requires Linux")
+
+    flags = getattr(os, "MFD_CLOEXEC", 0)
+    dst_fd = os.memfd_create(_memfd_name(source.rel), flags)
+    digest = hashlib.sha256()
+    src_fd = os.open(source.path, os.O_RDONLY)
+    try:
+        copied = 0
+        try:
+            copied = _copy_with_copy_file_range(src_fd, dst_fd, source.size, chunk_size)
+        except OSError:
+            os.lseek(src_fd, 0, os.SEEK_SET)
+            os.lseek(dst_fd, 0, os.SEEK_SET)
+            copied = 0
+
+        if copied != source.size:
+            os.ftruncate(dst_fd, 0)
+            os.lseek(src_fd, 0, os.SEEK_SET)
+            os.lseek(dst_fd, 0, os.SEEK_SET)
+            copied = _copy_with_read_write(src_fd, dst_fd, source.size, chunk_size)
+
+        if copied != source.size:
+            raise IOError(f"short copy for {source.path}: {copied} != {source.size}")
+
+        os.lseek(dst_fd, 0, os.SEEK_SET)
+        # Hash only a small prefix for diagnostics; full hashing doubles load time.
+        prefix = os.read(dst_fd, min(source.size, 1024 * 1024))
+        digest.update(prefix)
+        os.lseek(dst_fd, 0, os.SEEK_SET)
+        os.ftruncate(dst_fd, source.size)
+        return CachedFile(source=source, fd=dst_fd, digest_prefix=digest.hexdigest()[:16])
+    except Exception:
+        try:
+            os.close(dst_fd)
+        finally:
+            raise
+    finally:
+        os.close(src_fd)
+
+
+def load_model_into_memory(
+    source_root: Path,
+    include_patterns: tuple[str, ...] = (),
+    exclude_patterns: tuple[str, ...] = DEFAULT_EXCLUDES,
+    max_memory_fraction: float = 0.90,
+    force: bool = False,
+    progress: ProgressFn | None = None,
+    chunk_size: int = 64 * 1024 * 1024,
+    workers: int = 1,
+) -> CachedModel:
+    source_root = source_root.expanduser().resolve()
+    source_files = collect_source_files(source_root, include_patterns, exclude_patterns)
+    total = sum(item.size for item in source_files)
+    if not source_files:
+        raise RuntimeError(f"no regular files selected under {source_root}")
+    if progress:
+        progress(0, total, Path("."))
+
+    available = available_memory_bytes()
+    if available is not None and total > int(available * max_memory_fraction) and not force:
+        raise MemoryError(
+            "selected model is larger than the memory budget: "
+            f"{human_bytes(total)} selected, {human_bytes(available)} available, "
+            f"budget fraction {max_memory_fraction:.2f}; rerun with --force to bypass"
+        )
+
+    copied = 0
+    cached_by_index: list[CachedFile | None] = [None] * len(source_files)
+    futures = {}
+    try:
+        if workers <= 1:
+            for index, item in enumerate(source_files):
+                cached_item = copy_file_to_memfd(item, chunk_size=chunk_size)
+                cached_by_index[index] = cached_item
+                copied += item.size
+                if progress:
+                    progress(copied, total, item.rel)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(copy_file_to_memfd, item, chunk_size): (index, item)
+                    for index, item in enumerate(source_files)
+                }
+                for future in as_completed(futures):
+                    index, item = futures[future]
+                    cached_item = future.result()
+                    cached_by_index[index] = cached_item
+                    copied += item.size
+                    if progress:
+                        progress(copied, total, item.rel)
+        cached = [item for item in cached_by_index if item is not None]
+        return CachedModel(
+            source_root=source_root,
+            files=cached,
+            total_bytes=total,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+            workers=max(1, workers),
+        )
+    except Exception:
+        closed_fds = set()
+        for item in cached_by_index:
+            if item is None:
+                continue
+            item.close()
+            closed_fds.add(item.fd)
+        for future in futures:
+            if not future.done() or future.cancelled():
+                continue
+            try:
+                item = future.result()
+            except Exception:
+                continue
+            if item.fd not in closed_fds:
+                item.close()
+                closed_fds.add(item.fd)
+        raise
+
+
+def _safe_remove_view(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    resolved = path.resolve(strict=False)
+    if str(resolved) in {"/", str(Path.home())}:
+        raise RuntimeError(f"refusing to remove unsafe view path {path}")
+    is_tmp = ".tmp." in path.name
+    is_iloader_view = (path / ".iloader" / "manifest.json").exists() if path.is_dir() else False
+    if path.is_dir() and not is_tmp and not is_iloader_view:
+        try:
+            path.rmdir()
+            return
+        except OSError as exc:
+            raise RuntimeError(f"refusing to remove non-InfiniLoader directory {path}") from exc
+    if path.is_symlink() or path.is_file():
+        if not is_tmp:
+            raise RuntimeError(f"refusing to remove non-InfiniLoader file {path}")
+        path.unlink()
+    else:
+        shutil.rmtree(path)
+
+
+def build_view(cached: CachedModel, view_path: Path, replace: bool = False) -> Path:
+    view_path = view_path.expanduser().resolve(strict=False)
+    if view_path == cached.source_root:
+        raise RuntimeError("view path must be different from source model path")
+    parent = view_path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_path = parent / f".{view_path.name}.tmp.{os.getpid()}"
+    _safe_remove_view(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=False)
+
+    try:
+        for item in cached.files:
+            dest = tmp_path / item.source.rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(item.proc_path, dest)
+
+        manifest_dir = tmp_path / ".iloader"
+        manifest_dir.mkdir(exist_ok=True)
+        manifest = cached.to_manifest(view_path=view_path)
+        (manifest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+
+        if view_path.exists() or view_path.is_symlink():
+            if not replace:
+                raise FileExistsError(f"{view_path} already exists; pass --replace")
+            _safe_remove_view(view_path)
+        os.replace(tmp_path, view_path)
+        return view_path
+    except Exception:
+        _safe_remove_view(tmp_path)
+        raise

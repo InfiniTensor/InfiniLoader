@@ -1,0 +1,253 @@
+from __future__ import annotations
+
+import json
+import os
+import signal
+import socket
+import time
+import traceback
+from pathlib import Path
+from typing import Any
+
+from .cache import CachedModel, build_view, human_bytes, load_model_into_memory
+
+
+class WeightLoaderDaemon:
+    def __init__(
+        self,
+        *,
+        name: str,
+        source: Path,
+        view: Path,
+        socket_path: Path,
+        pid_path: Path,
+        state_path: Path,
+        upstream_source: Path | None,
+        local_cache_path: Path | None,
+        include_patterns: tuple[str, ...],
+        exclude_patterns: tuple[str, ...],
+        replace: bool,
+        force: bool,
+        max_memory_fraction: float,
+        chunk_size: int,
+        workers: int,
+        quiet: bool = False,
+    ) -> None:
+        self.name = name
+        self.source = source
+        self.view = view
+        self.socket_path = socket_path
+        self.pid_path = pid_path
+        self.state_path = state_path
+        self.upstream_source = upstream_source
+        self.local_cache_path = local_cache_path
+        self.include_patterns = include_patterns
+        self.exclude_patterns = exclude_patterns
+        self.replace = replace
+        self.force = force
+        self.max_memory_fraction = max_memory_fraction
+        self.chunk_size = chunk_size
+        self.workers = workers
+        self.quiet = quiet
+        self.cached: CachedModel | None = None
+        self.started_at = time.time()
+        self.load_started_at: float | None = None
+        self.load_finished_at: float | None = None
+        self._stop = False
+        self._remove_view_on_exit = False
+
+    def log(self, message: str) -> None:
+        if not self.quiet:
+            print(message, flush=True)
+
+    def _write_state(self, state: dict[str, Any]) -> None:
+        state.setdefault("name", self.name)
+        state.setdefault("pid", os.getpid())
+        state.setdefault("source", str(self.source))
+        state.setdefault("view", str(self.view))
+        state.setdefault("socket", str(self.socket_path))
+        state.setdefault("started_at", self.started_at)
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.state_path.with_name(f".{self.state_path.name}.tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, self.state_path)
+
+    def _progress(self, copied: int, total: int, rel: Path) -> None:
+        pct = copied / total * 100 if total else 100.0
+        elapsed = time.time() - self.load_started_at if self.load_started_at else 0.0
+        rate = copied / elapsed if elapsed > 0 and copied > 0 else None
+        remaining = total - copied
+        eta = remaining / rate if rate and remaining > 0 else None
+        self._write_state(
+            {
+                "state": "loading",
+                "load_started_at": self.load_started_at,
+                "copied_bytes": copied,
+                "copied_human": human_bytes(copied),
+                "total_bytes": total,
+                "total_human": human_bytes(total),
+                "progress": copied / total if total else 1.0,
+                "current_file": None if rel.as_posix() == "." else rel.as_posix(),
+                "elapsed_seconds": elapsed,
+                "rate_bytes_per_second": rate,
+                "rate_human_per_second": f"{human_bytes(int(rate))}/s" if rate else None,
+                "eta_seconds": eta,
+            }
+        )
+        self.log(f"[load] {pct:6.2f}% {human_bytes(copied)} / {human_bytes(total)} cached; last={rel.as_posix()}")
+
+    def load(self) -> None:
+        self.log(f"[load] source={self.source}")
+        self.load_started_at = time.time()
+        self._write_state({"state": "loading", "load_started_at": self.load_started_at, "copied_bytes": 0})
+        self.cached = load_model_into_memory(
+            self.source,
+            include_patterns=self.include_patterns,
+            exclude_patterns=self.exclude_patterns,
+            max_memory_fraction=self.max_memory_fraction,
+            force=self.force,
+            progress=self._progress,
+            chunk_size=self.chunk_size,
+            workers=self.workers,
+        )
+        self.load_finished_at = time.time()
+        build_view(self.cached, self.view, replace=self.replace)
+        load_seconds = self.load_finished_at - self.load_started_at
+        self._write_state(
+            {
+                "state": "ready",
+                "load_started_at": self.load_started_at,
+                "load_finished_at": self.load_finished_at,
+                "load_seconds": load_seconds,
+                "copied_bytes": self.cached.total_bytes,
+                "copied_human": human_bytes(self.cached.total_bytes),
+                "total_bytes": self.cached.total_bytes,
+                "total_human": human_bytes(self.cached.total_bytes),
+                "progress": 1.0,
+                "file_count": len(self.cached.files),
+                "workers": self.workers,
+                "rate_bytes_per_second": self.cached.total_bytes / load_seconds if load_seconds > 0 else None,
+            }
+        )
+        self.log(f"[ready] name={self.name} view={self.view} files={len(self.cached.files)} bytes={human_bytes(self.cached.total_bytes)}")
+
+    def _status(self) -> dict[str, Any]:
+        assert self.cached is not None
+        return {
+            "name": self.name,
+            "pid": os.getpid(),
+            "source": str(self.source),
+            "upstream_source": str(self.upstream_source) if self.upstream_source else None,
+            "local_cache_path": str(self.local_cache_path) if self.local_cache_path else None,
+            "view": str(self.view),
+            "socket": str(self.socket_path),
+            "started_at": self.started_at,
+            "uptime_seconds": time.time() - self.started_at,
+            "load_seconds": (self.load_finished_at - self.load_started_at) if self.load_started_at and self.load_finished_at else None,
+            "file_count": len(self.cached.files),
+            "total_bytes": self.cached.total_bytes,
+            "total_human": human_bytes(self.cached.total_bytes),
+            "include_patterns": list(self.include_patterns),
+            "exclude_patterns": list(self.exclude_patterns),
+            "workers": self.workers,
+        }
+
+    def _handle(self, payload: dict[str, Any]) -> dict[str, Any]:
+        command = payload.get("command")
+        if command == "ping":
+            return {"ok": True, "pong": True}
+        if command == "status":
+            return {"ok": True, "status": self._status()}
+        if command == "manifest":
+            assert self.cached is not None
+            return {"ok": True, "manifest": self.cached.to_manifest(self.view)}
+        if command == "stop":
+            self._remove_view_on_exit = bool(payload.get("remove_view", False))
+            self._stop = True
+            return {"ok": True, "stopping": True}
+        return {"ok": False, "error": f"unknown command: {command!r}"}
+
+    def _cleanup_socket(self) -> None:
+        try:
+            if self.socket_path.exists() or self.socket_path.is_socket():
+                self.socket_path.unlink()
+        except OSError:
+            pass
+        try:
+            if self.pid_path.exists():
+                self.pid_path.unlink()
+        except OSError:
+            pass
+        try:
+            if self.state_path.exists():
+                self.state_path.unlink()
+        except OSError:
+            pass
+
+    def _install_signal_handlers(self) -> None:
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+
+    def _handle_signal(self, signum: int, _frame: object) -> None:
+        self.log(f"[signal] received {signum}, shutting down")
+        if self.cached is None:
+            self._cleanup_socket()
+            os._exit(0)
+        self._stop = True
+
+    def serve_forever(self) -> int:
+        self._install_signal_handlers()
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        self.pid_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.socket_path.exists():
+            self.socket_path.unlink()
+        self.pid_path.write_text(str(os.getpid()), encoding="utf-8")
+        self._write_state({"state": "starting"})
+
+        server: socket.socket | None = None
+
+        try:
+            self.load()
+
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.settimeout(1.0)
+            server.bind(str(self.socket_path))
+            server.listen(16)
+            self.log(f"[listen] socket={self.socket_path}")
+
+            while not self._stop:
+                try:
+                    conn, _ = server.accept()
+                except socket.timeout:
+                    continue
+                with conn:
+                    data = bytearray()
+                    while True:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        data.extend(chunk)
+                        if b"\n" in chunk:
+                            break
+                    try:
+                        payload = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
+                        response = self._handle(payload)
+                    except Exception as exc:  # pragma: no cover - defensive server path
+                        response = {"ok": False, "error": str(exc), "traceback": traceback.format_exc()}
+                    conn.sendall(json.dumps(response).encode("utf-8") + b"\n")
+        finally:
+            if server is not None:
+                server.close()
+            self._cleanup_socket()
+            if self.cached is not None:
+                self.cached.close()
+            if self._remove_view_on_exit:
+                import shutil
+
+                try:
+                    shutil.rmtree(self.view)
+                except OSError:
+                    pass
+            self.log("[stop] daemon exited")
+        return 0
