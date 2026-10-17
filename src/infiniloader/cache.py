@@ -41,6 +41,9 @@ class SourceFile:
     size: int
     mode: int
     mtime_ns: int
+    ctime_ns: int = 0
+    device: int = 0
+    inode: int = 0
 
     @property
     def rel_posix(self) -> str:
@@ -58,8 +61,9 @@ class CachedFile:
         return f"/proc/{os.getpid()}/fd/{self.fd}"
 
     def close(self) -> None:
+        fd, self.fd = self.fd, -1
         try:
-            os.close(self.fd)
+            os.close(fd)
         except OSError:
             pass
 
@@ -150,16 +154,15 @@ def collect_source_files(
 
     files: list[SourceFile] = []
     for path in sorted(source_root.rglob("*")):
-        try:
-            st = path.stat()
-        except OSError:
-            continue
-        if not stat.S_ISREG(st.st_mode):
-            continue
         rel = path.relative_to(source_root)
         if not should_include(rel, include_patterns, exclude_patterns):
             continue
-        files.append(SourceFile(path=path, rel=rel, size=st.st_size, mode=st.st_mode, mtime_ns=st.st_mtime_ns))
+        st = path.stat()
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        files.append(SourceFile(path=path, rel=rel, size=st.st_size, mode=st.st_mode,
+                                mtime_ns=st.st_mtime_ns, ctime_ns=st.st_ctime_ns,
+                                device=st.st_dev, inode=st.st_ino))
     return files
 
 
@@ -193,7 +196,7 @@ def source_identity(source_root: Path, include_patterns: tuple[str, ...] = (),
     description = {
         "source_root": str(root), "include_patterns": list(include_patterns),
         "exclude_patterns": list(exclude_patterns),
-        "files": [(f.rel_posix, f.size, f.mtime_ns) for f in files],
+        "files": [(f.rel_posix, f.size, f.mtime_ns, f.ctime_ns, f.device, f.inode) for f in files],
     }
     return {"source_root": str(root), "fingerprint": hashlib.sha256(
         json.dumps(description, sort_keys=True).encode()).hexdigest()}
@@ -222,7 +225,7 @@ def _copy_with_copy_file_range(src_fd: int, dst_fd: int, size: int, chunk_size: 
 
 def _copy_with_read_write(src_fd: int, dst_fd: int, size: int, chunk_size: int) -> int:
     copied = 0
-    while True:
+    while copied < size:
         data = os.read(src_fd, min(chunk_size, max(size - copied, 1)))
         if not data:
             break
@@ -238,11 +241,20 @@ def copy_file_to_memfd(source: SourceFile, chunk_size: int = 64 * 1024 * 1024) -
     if not hasattr(os, "memfd_create"):
         raise RuntimeError("memfd_create is not available; InfiniLoader requires Linux")
 
-    flags = getattr(os, "MFD_CLOEXEC", 0)
-    dst_fd = os.memfd_create(_memfd_name(source.rel), flags)
-    digest = hashlib.sha256()
+    import fcntl
+
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
     src_fd = os.open(source.path, os.O_RDONLY)
+    dst_fd = None
     try:
+        before = os.fstat(src_fd)
+        if (before.st_size, before.st_mtime_ns) != (source.size, source.mtime_ns):
+            raise RuntimeError(f"source changed before preload: {source.path}")
+        if source.inode and (before.st_dev, before.st_ino, before.st_ctime_ns) != (source.device, source.inode, source.ctime_ns):
+            raise RuntimeError(f"source replaced before preload: {source.path}")
+        flags = os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+        dst_fd = os.memfd_create(_memfd_name(source.rel), flags)
         copied = 0
         try:
             copied = _copy_with_copy_file_range(src_fd, dst_fd, source.size, chunk_size)
@@ -259,17 +271,24 @@ def copy_file_to_memfd(source: SourceFile, chunk_size: int = 64 * 1024 * 1024) -
 
         if copied != source.size:
             raise IOError(f"short copy for {source.path}: {copied} != {source.size}")
+        after = os.fstat(src_fd)
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise RuntimeError(f"source changed during preload: {source.path}")
 
         os.lseek(dst_fd, 0, os.SEEK_SET)
         # Hash only a small prefix for diagnostics; full hashing doubles load time.
         prefix = os.read(dst_fd, min(source.size, 1024 * 1024))
-        digest.update(prefix)
+        digest = hashlib.sha256(prefix)
         os.lseek(dst_fd, 0, os.SEEK_SET)
         os.ftruncate(dst_fd, source.size)
+        fcntl.fcntl(dst_fd, fcntl.F_ADD_SEALS,
+                    fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+        os.fchmod(dst_fd, 0o400)
         return CachedFile(source=source, fd=dst_fd, digest_prefix=digest.hexdigest()[:16])
     except Exception:
         try:
-            os.close(dst_fd)
+            if dst_fd is not None:
+                os.close(dst_fd)
         finally:
             raise
     finally:
@@ -286,6 +305,8 @@ def load_model_into_memory(
     chunk_size: int = 64 * 1024 * 1024,
     workers: int = 1,
 ) -> CachedModel:
+    if chunk_size <= 0 or workers < 1 or not 0 < max_memory_fraction <= 1:
+        raise ValueError("chunk_size and workers must be positive; memory fraction must be in (0, 1]")
     source_root = source_root.expanduser().resolve()
     source_files = collect_source_files(source_root, include_patterns, exclude_patterns)
     total = sum(item.size for item in source_files)
@@ -326,6 +347,8 @@ def load_model_into_memory(
                     copied += item.size
                     if progress:
                         progress(copied, total, item.rel)
+        if collect_source_files(source_root, include_patterns, exclude_patterns) != source_files:
+            raise RuntimeError("source model changed during preload; retry using an immutable model revision")
         cached = [item for item in cached_by_index if item is not None]
         return CachedModel(
             source_root=source_root,
