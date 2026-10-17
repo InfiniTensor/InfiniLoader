@@ -923,6 +923,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         for run in result["runs"]:
             print(f"run {run['run']}: {run['seconds']:.3f}s, {run['gib_per_second']:.3f} GiB/s")
         print(f"best:  {result['best_gib_per_second']:.3f} GiB/s")
+        print(f"median: {result['median_seconds']:.3f}s; cache state: {result['cache_state']}")
     return 0
 
 
