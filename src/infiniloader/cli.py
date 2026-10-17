@@ -18,7 +18,7 @@ from .runtime import FileLock, process_matches, read_json, signal_owned_process,
 from .daemon import WeightLoaderDaemon
 from .distributed import build_tp_plan, create_rank_views, simulate_distributed_read
 from .ipc import LoaderConnectionError, request
-from .local_cache import cache_status, list_model_caches, materialize_model_cache
+from .local_cache import cache_status, list_model_caches, materialize_model_cache, verify_cache, garbage_collect, lease_path, touch_cache
 from .paths import (
     default_log_path,
     default_pid_path,
@@ -317,6 +317,8 @@ def _start_locked(args: argparse.Namespace) -> int:
             return 0
     else:
         source, upstream_source, local_cache_path = _prepare_model_source(args)
+        if source_identity(Path(args.model), _patterns(args.pattern), tuple(args.exclude or DEFAULT_EXCLUDES)) != args.identity:
+            raise RuntimeError("source model changed while preparing local cache; retry")
         log_path = Path(args.log_file).expanduser() if args.log_file else default_log_path(args.name, getattr(args, "base_dir", None))
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("ab", buffering=0) as log:
@@ -586,12 +588,40 @@ def cmd_cache_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    path = Path(args.path).expanduser().absolute()
+    with FileLock(lease_path(path), shared=True):
+        data = verify_cache(path, full=not args.quick)
+    if args.json:
+        _print_json(data)
+    else:
+        print(f"valid: {data['valid']} ({data['checked_files']} files)")
+        for error in data["errors"]:
+            print(error, file=sys.stderr)
+    return 0 if data["valid"] else 1
+
+
+def cmd_gc(args: argparse.Namespace) -> int:
+    data = garbage_collect(cache_root=args.cache_root, base_dir=args.base_dir,
+                           max_bytes=args.max_bytes, ttl=args.ttl, apply=args.apply)
+    if args.json:
+        _print_json(data)
+    else:
+        print("removed:" if args.apply else "would remove:")
+        for row in data["candidates"]:
+            print(f"  {row['cache_path']} ({row['total_human']})")
+        for row in data["skipped"]:
+            print(f"  skipped: {row['cache_path']} ({row['reason']})")
+        print(f"remaining: {human_bytes(data['remaining_bytes'])}; budget met: {data['budget_met']}")
+    return 0 if data["budget_met"] else 1
+
+
 BASH_COMPLETION = r'''_iloader_complete() {
   local cur prev sub commands opts
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="inspect start list status view manifest stop bench selftest cache cache-status cache-list dist-views dist-simulate dist-plan completion"
+  commands="inspect start list status view manifest stop bench selftest cache cache-status cache-list verify gc dist-views dist-simulate dist-plan completion"
 
   if [[ ${COMP_CWORD} -eq 1 ]]; then
     COMPREPLY=( $(compgen -W "${commands}" -- "${cur}") )
@@ -891,6 +921,21 @@ def build_parser() -> argparse.ArgumentParser:
     cache_list_p.add_argument("--base-dir")
     cache_list_p.add_argument("--json", action="store_true")
     cache_list_p.set_defaults(func=cmd_cache_list)
+
+    verify_p = sub.add_parser("verify", help="verify a versioned local cache using SHA-256")
+    verify_p.add_argument("path")
+    verify_p.add_argument("--quick", action="store_true", help="check file metadata without reading all bytes")
+    verify_p.add_argument("--json", action="store_true")
+    verify_p.set_defaults(func=cmd_verify)
+
+    gc_p = sub.add_parser("gc", help="preview or apply LRU/TTL collection of unleased disk caches")
+    gc_p.add_argument("--base-dir")
+    gc_p.add_argument("--cache-root")
+    gc_p.add_argument("--max-bytes", type=int, help="target total disk cache bytes")
+    gc_p.add_argument("--ttl", type=float, help="collect caches unused for this many seconds")
+    gc_p.add_argument("--apply", action="store_true", help="delete the selected caches; default is dry run")
+    gc_p.add_argument("--json", action="store_true")
+    gc_p.set_defaults(func=cmd_gc)
 
     list_p = sub.add_parser("list", help="list active resident caches")
     list_p.add_argument("--base-dir")

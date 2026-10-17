@@ -14,6 +14,7 @@ from typing import Any
 
 from .cache import CachedModel, build_view, human_bytes, load_model_into_memory, source_identity, _safe_remove_view
 from .runtime import FileLock, atomic_json, process_token
+from .local_cache import lease_path, verify_cache
 
 
 class WeightLoaderDaemon:
@@ -246,6 +247,10 @@ class WeightLoaderDaemon:
         with ExitStack() as locks:
             locks.enter_context(FileLock(self.socket_path.with_suffix(".owner.lock"), timeout=0))
             locks.enter_context(FileLock(self.view.parent / f".{self.view.name}.owner.lock", timeout=0))
+            if self.local_cache_path:
+                locks.enter_context(FileLock(lease_path(self.local_cache_path), shared=True))
+                if not verify_cache(self.local_cache_path, full=False)["valid"]:
+                    raise RuntimeError("local cache changed or was removed before daemon startup")
             self._owns_runtime = True
             try:
                 return self._serve_owned()
@@ -269,6 +274,8 @@ class WeightLoaderDaemon:
 
         try:
             self.load()
+            if source_identity(self.upstream_source or self.source, self.include_patterns, self.exclude_patterns) != self.identity:
+                raise RuntimeError("source model changed during startup; stop and retry")
 
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             server.settimeout(1.0)
