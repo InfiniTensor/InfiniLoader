@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from .runtime import validate_name
 
 
 APP_DIR_NAME = "infiniloader"
@@ -76,20 +77,25 @@ def model_cache_root(base_dir: str | os.PathLike[str] | None = None) -> Path:
 
 
 def default_socket_path(name: str, base_dir: str | os.PathLike[str] | None = None) -> Path:
+    validate_name(name)
     return runtime_dir(base_dir) / f"{name}.sock"
 
 
 def default_pid_path(name: str, base_dir: str | os.PathLike[str] | None = None) -> Path:
+    validate_name(name)
     return runtime_dir(base_dir) / f"{name}.pid"
 
 
 def default_state_path(name: str, base_dir: str | os.PathLike[str] | None = None) -> Path:
+    validate_name(name)
     return runtime_dir(base_dir) / f"{name}.state.json"
 
 
 def default_log_path(name: str, base_dir: str | os.PathLike[str] | None = None) -> Path:
+    validate_name(name)
     return logs_dir(base_dir) / f"{name}.log"
 
 
 def default_view_path(name: str, base_dir: str | os.PathLike[str] | None = None) -> Path:
+    validate_name(name)
     return view_root(base_dir) / name

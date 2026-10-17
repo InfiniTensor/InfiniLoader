@@ -6,10 +6,12 @@ import signal
 import socket
 import time
 import traceback
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
-from .cache import CachedModel, build_view, human_bytes, load_model_into_memory
+from .cache import CachedModel, build_view, human_bytes, load_model_into_memory, source_identity, _safe_remove_view
+from .runtime import FileLock, atomic_json, process_token
 
 
 class WeightLoaderDaemon:
@@ -32,6 +34,7 @@ class WeightLoaderDaemon:
         chunk_size: int,
         workers: int,
         quiet: bool = False,
+        identity: dict | None = None,
     ) -> None:
         self.name = name
         self.source = source
@@ -49,6 +52,9 @@ class WeightLoaderDaemon:
         self.chunk_size = chunk_size
         self.workers = workers
         self.quiet = quiet
+        self.identity = identity or {}
+        self.process_token = process_token(os.getpid())
+        self._owns_runtime = False
         self.cached: CachedModel | None = None
         self.started_at = time.time()
         self.load_started_at: float | None = None
@@ -67,10 +73,9 @@ class WeightLoaderDaemon:
         state.setdefault("view", str(self.view))
         state.setdefault("socket", str(self.socket_path))
         state.setdefault("started_at", self.started_at)
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_name(f".{self.state_path.name}.tmp.{os.getpid()}")
-        tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(tmp, self.state_path)
+        state.setdefault("identity", self.identity)
+        state.setdefault("process_token", self.process_token)
+        atomic_json(self.state_path, state)
 
     def _progress(self, copied: int, total: int, rel: Path) -> None:
         pct = copied / total * 100 if total else 100.0
@@ -135,6 +140,8 @@ class WeightLoaderDaemon:
         assert self.cached is not None
         return {
             "name": self.name,
+            "identity": self.identity,
+            "process_token": self.process_token,
             "pid": os.getpid(),
             "source": str(self.source),
             "upstream_source": str(self.upstream_source) if self.upstream_source else None,
@@ -168,6 +175,8 @@ class WeightLoaderDaemon:
         return {"ok": False, "error": f"unknown command: {command!r}"}
 
     def _cleanup_socket(self) -> None:
+        if not self._owns_runtime:
+            return
         try:
             if self.socket_path.exists() or self.socket_path.is_socket():
                 self.socket_path.unlink()
@@ -196,6 +205,18 @@ class WeightLoaderDaemon:
         self._stop = True
 
     def serve_forever(self) -> int:
+        with ExitStack() as locks:
+            locks.enter_context(FileLock(self.socket_path.with_suffix(".owner.lock"), timeout=0))
+            locks.enter_context(FileLock(self.view.parent / f".{self.view.name}.owner.lock", timeout=0))
+            self._owns_runtime = True
+            try:
+                return self._serve_owned()
+            finally:
+                self._owns_runtime = False
+
+    def _serve_owned(self) -> int:
+        if not self.identity:
+            self.identity = source_identity(self.upstream_source or self.source, self.include_patterns, self.exclude_patterns)
         self._install_signal_handlers()
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         self.pid_path.parent.mkdir(parents=True, exist_ok=True)
@@ -243,11 +264,9 @@ class WeightLoaderDaemon:
             if self.cached is not None:
                 self.cached.close()
             if self._remove_view_on_exit:
-                import shutil
-
                 try:
-                    shutil.rmtree(self.view)
-                except OSError:
-                    pass
+                    _safe_remove_view(self.view, expected_pid=os.getpid())
+                except (OSError, RuntimeError) as exc:
+                    self.log(f"[cleanup] {exc}")
             self.log("[stop] daemon exited")
         return 0

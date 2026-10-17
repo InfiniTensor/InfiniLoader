@@ -7,10 +7,12 @@ import os
 import shutil
 import stat
 import time
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
+from .runtime import read_json
 
 
 DEFAULT_EXCLUDES = (
@@ -184,6 +186,19 @@ def inspect_source(
     }
 
 
+def source_identity(source_root: Path, include_patterns: tuple[str, ...] = (),
+                    exclude_patterns: tuple[str, ...] = DEFAULT_EXCLUDES) -> dict:
+    root = source_root.expanduser().resolve()
+    files = collect_source_files(root, include_patterns, exclude_patterns)
+    description = {
+        "source_root": str(root), "include_patterns": list(include_patterns),
+        "exclude_patterns": list(exclude_patterns),
+        "files": [(f.rel_posix, f.size, f.mtime_ns) for f in files],
+    }
+    return {"source_root": str(root), "fingerprint": hashlib.sha256(
+        json.dumps(description, sort_keys=True).encode()).hexdigest()}
+
+
 def _memfd_name(rel: Path) -> str:
     rel_text = rel.as_posix()
     digest = hashlib.sha1(rel_text.encode("utf-8")).hexdigest()[:12]
@@ -340,38 +355,30 @@ def load_model_into_memory(
         raise
 
 
-def _safe_remove_view(path: Path) -> None:
+def _safe_remove_view(path: Path, expected_pid: int | None = None) -> None:
     if not path.exists() and not path.is_symlink():
         return
     resolved = path.resolve(strict=False)
     if str(resolved) in {"/", str(Path.home())}:
         raise RuntimeError(f"refusing to remove unsafe view path {path}")
-    is_tmp = ".tmp." in path.name
-    is_iloader_view = (path / ".iloader" / "manifest.json").exists() if path.is_dir() else False
-    if path.is_dir() and not is_tmp and not is_iloader_view:
-        try:
-            path.rmdir()
-            return
-        except OSError as exc:
-            raise RuntimeError(f"refusing to remove non-InfiniLoader directory {path}") from exc
-    if path.is_symlink() or path.is_file():
-        if not is_tmp:
-            raise RuntimeError(f"refusing to remove non-InfiniLoader file {path}")
-        path.unlink()
-    else:
-        shutil.rmtree(path)
+    manifest = read_json(path / ".iloader" / "manifest.json") if path.is_dir() else None
+    if path.is_symlink() or not manifest or manifest.get("format_version") != 1:
+        raise RuntimeError(f"refusing to remove non-InfiniLoader directory {path}")
+    if expected_pid is not None and manifest.get("daemon_pid") != expected_pid:
+        raise RuntimeError(f"view belongs to another daemon: {path}")
+    shutil.rmtree(path)
 
 
 def build_view(cached: CachedModel, view_path: Path, replace: bool = False) -> Path:
-    view_path = view_path.expanduser().resolve(strict=False)
+    view_path = view_path.expanduser().absolute()
+    if view_path.is_symlink():
+        raise RuntimeError("view path must not be a symlink")
     if view_path == cached.source_root:
         raise RuntimeError("view path must be different from source model path")
     parent = view_path.parent
     parent.mkdir(parents=True, exist_ok=True)
 
-    tmp_path = parent / f".{view_path.name}.tmp.{os.getpid()}"
-    _safe_remove_view(tmp_path)
-    tmp_path.mkdir(parents=True, exist_ok=False)
+    tmp_path = Path(tempfile.mkdtemp(prefix=f".{view_path.name}.tmp.", dir=parent))
 
     try:
         for item in cached.files:
@@ -391,5 +398,5 @@ def build_view(cached: CachedModel, view_path: Path, replace: bool = False) -> P
         os.replace(tmp_path, view_path)
         return view_path
     except Exception:
-        _safe_remove_view(tmp_path)
+        shutil.rmtree(tmp_path)
         raise
