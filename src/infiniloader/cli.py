@@ -14,7 +14,7 @@ from pathlib import Path
 from . import __version__
 from .benchmark import benchmark_path
 from .cache import DEFAULT_EXCLUDES, build_view, human_bytes, inspect_source, load_model_into_memory, source_identity, _safe_remove_view
-from .runtime import FileLock, process_matches, read_json, signal_owned_process, validate_name
+from .runtime import FileLock, process_matches, process_token, read_json, signal_owned_process, validate_name
 from .memory import parse_bytes
 from .daemon import WeightLoaderDaemon
 from .distributed import build_tp_plan, create_rank_views, simulate_distributed_read
@@ -242,6 +242,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         max_memory_bytes=args.max_memory_bytes,
         reserve_bytes=args.reserve_bytes,
         max_resident_bytes=args.max_resident_bytes,
+        idle_ttl=args.idle_ttl,
     )
     return daemon.serve_forever()
 
@@ -287,6 +288,8 @@ def _daemon_command(args: argparse.Namespace, model_path: Path | None = None, up
     for option in ("max_memory_bytes", "max_resident_bytes"):
         if getattr(args, option, None) is not None:
             command.extend(["--" + option.replace("_", "-"), str(getattr(args, option))])
+    if args.idle_ttl is not None:
+        command.extend(["--idle-ttl", str(args.idle_ttl)])
     return command
 
 
@@ -303,6 +306,8 @@ def _require_identity(args: argparse.Namespace, status: dict) -> None:
         raise RuntimeError("name already belongs to a different view path")
     if args.refresh_cache:
         raise RuntimeError("stop the running cache before requesting --refresh-cache")
+    if args.idle_ttl is not None and status.get("idle_ttl") != args.idle_ttl:
+        raise RuntimeError("stop the running cache before changing --idle-ttl")
 
 
 def _start_locked(args: argparse.Namespace) -> int:
@@ -313,6 +318,7 @@ def _start_locked(args: argparse.Namespace) -> int:
         status = None
     if status is not None:
         _require_identity(args, status)
+        request(sock, {"command": "touch"})
         print(status["view"])
         print(f"already running: name={args.name} pid={status['pid']}", file=sys.stderr)
         return 0
@@ -357,6 +363,7 @@ def _start_locked(args: argparse.Namespace) -> int:
             time.sleep(0.1)
             continue
         _require_identity(args, status)
+        request(sock, {"command": "touch"})
         if sys.stderr.isatty() and last_progress:
             print(file=sys.stderr)
         print(status["view"])
@@ -482,7 +489,8 @@ def cmd_list(args: argparse.Namespace) -> int:
 def _stop_one(args: argparse.Namespace) -> int:
     _resolve_name(args)
     try:
-        response = request(_socket(args), {"command": "stop", "remove_view": args.remove_view}, timeout=args.timeout)
+        response = request(_socket(args), {"command": "stop", "remove_view": args.remove_view,
+                                          "force": getattr(args, "force", False)}, timeout=args.timeout)
         print(f"{args.name}: {'stopping' if response.get('stopping') else 'ok'}")
         return 0
     except LoaderConnectionError as exc:
@@ -520,6 +528,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 view=None,
                 timeout=args.timeout,
                 remove_view=args.remove_view,
+                force=getattr(args, "force", False),
             )
             rc = max(rc, _stop_one(ns))
         return rc
@@ -610,8 +619,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_gc(args: argparse.Namespace) -> int:
-    data = garbage_collect(cache_root=args.cache_root, base_dir=args.base_dir,
-                           max_bytes=args.max_bytes, ttl=args.ttl, apply=args.apply)
+    data = _gc_resident(args) if args.resident else garbage_collect(
+        cache_root=args.cache_root, base_dir=args.base_dir,
+        max_bytes=args.max_bytes, ttl=args.ttl, apply=args.apply)
     if args.json:
         _print_json(data)
     else:
@@ -624,12 +634,100 @@ def cmd_gc(args: argparse.Namespace) -> int:
     return 0 if data["budget_met"] else 1
 
 
+def _gc_resident(args: argparse.Namespace) -> dict:
+    rows = _active_daemon_rows(args)
+    total = sum(row.get("total_bytes", 0) for row in rows)
+    candidates, skipped = [], []
+    for row in sorted(rows, key=lambda r: r.get("last_used_at", float("inf"))):
+        expired = args.ttl is not None and time.time() - row.get("last_used_at", time.time()) >= args.ttl
+        if not expired and not (args.max_bytes is not None and total > args.max_bytes):
+            continue
+        if row.get("state") != "ready" or row.get("active_leases"):
+            skipped.append(dict(cache_path=row.get("view", row["name"]), reason="loading, unavailable or leased"))
+            continue
+        if args.apply:
+            try:
+                request(row["socket"], {"command": "evict", "last_used_at": row["last_used_at"], "remove_view": True})
+            except (LoaderConnectionError, RuntimeError) as exc:
+                skipped.append(dict(cache_path=row["view"], reason=str(exc)))
+                continue
+        candidates.append(dict(cache_path=row["view"], total_human=row["total_human"]))
+        total -= row["total_bytes"]
+    return dict(apply=args.apply, candidates=candidates, skipped=skipped, remaining_bytes=total,
+                budget_met=args.max_bytes is None or total <= args.max_bytes)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from .diagnostics import diagnose
+
+    data = diagnose(Path(args.base_dir) if args.base_dir else None)
+    if args.json:
+        _print_json(data)
+    else:
+        for check in data["checks"]:
+            print(f"{'ok' if check['ok'] else 'FAIL'}: {check['name']}: {check['detail']}")
+        print(f"effective memory headroom: {data['memory']['available_bytes']} bytes")
+        for warning in data["warnings"]:
+            print(f"note: {warning}")
+    return 0 if data["ok"] else 1
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    program = args.program[1:] if args.program[:1] == ["--"] else args.program
+    if args.cache_path and args.name_arg:
+        program = [args.name_arg] + program
+    if not program or not (args.name_arg or args.cache_path):
+        raise ValueError("use run NAME -- COMMAND ... or run --cache-path PATH -- COMMAND ...")
+    if args.cache_path:
+        path = Path(args.cache_path).expanduser().resolve()
+        with FileLock(lease_path(path), shared=True) as lease:
+            if not verify_cache(path, full=False)["valid"]:
+                raise RuntimeError("cache is missing or invalid; run verify or rebuild it")
+            touch_cache(path)
+            return _run_program(program, path, pass_fds=(lease.fd,))
+    args.name = _resolve_name(args)
+    sock = _socket(args)
+    lease = request(sock, {"command": "lease-acquire", "pid": os.getpid(), "process_token": process_token(os.getpid())})
+    try:
+        return _run_program(program, Path(lease["view"]), socket_path=sock, lease=lease["lease"])
+    finally:
+        try:
+            request(sock, {"command": "lease-release", "lease": lease["lease"]})
+        except (LoaderConnectionError, RuntimeError):
+            pass
+
+
+def _run_program(program, path, *, pass_fds=(), socket_path=None, lease=None) -> int:
+    env = dict(os.environ, ILOADER_MODEL_PATH=str(path))
+    proc = subprocess.Popen([part.replace("{model}", str(path)) for part in program], env=env, pass_fds=pass_fds)
+    try:
+        if lease:
+            token = process_token(proc.pid)
+            if proc.poll() is None:
+                try:
+                    request(socket_path, {"command": "lease-update", "lease": lease, "pid": proc.pid,
+                                          "process_token": token})
+                except RuntimeError:
+                    if proc.poll() is None:
+                        raise
+        return proc.wait()
+    except BaseException:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        raise
+
+
 BASH_COMPLETION = r'''_iloader_complete() {
   local cur prev sub commands opts
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="inspect start list status view manifest stop bench selftest cache cache-status cache-list verify gc dist-views dist-simulate dist-plan completion"
+  commands="inspect start list status view manifest stop bench selftest cache cache-status cache-list verify gc run doctor dist-views dist-simulate dist-plan completion"
 
   if [[ ${COMP_CWORD} -eq 1 ]]; then
     COMPREPLY=( $(compgen -W "${commands}" -- "${cur}") )
@@ -902,6 +1000,7 @@ def build_parser() -> argparse.ArgumentParser:
         memory_parser.add_argument("--max-memory-bytes", type=parse_bytes, help="per-cache preload cap including worker buffers")
         memory_parser.add_argument("--reserve-bytes", type=parse_bytes, default=256 * 1024 * 1024, help="headroom left for the engine; default 256 MiB")
         memory_parser.add_argument("--max-resident-bytes", type=parse_bytes, help="set persistent total resident quota for this base directory")
+        memory_parser.add_argument("--idle-ttl", type=float, help="evict after this many idle seconds; use run to protect readers")
 
     cache_p = sub.add_parser("cache", help="materialize a local model cache")
     cache_p.add_argument("model")
@@ -944,11 +1043,24 @@ def build_parser() -> argparse.ArgumentParser:
     gc_p = sub.add_parser("gc", help="preview or apply LRU/TTL collection of unleased disk caches")
     gc_p.add_argument("--base-dir")
     gc_p.add_argument("--cache-root")
-    gc_p.add_argument("--max-bytes", type=int, help="target total disk cache bytes")
+    gc_p.add_argument("--max-bytes", type=parse_bytes, help="target total cache bytes; accepts GiB/MiB")
+    gc_p.add_argument("--resident", action="store_true", help="collect resident daemons instead of disk caches")
     gc_p.add_argument("--ttl", type=float, help="collect caches unused for this many seconds")
     gc_p.add_argument("--apply", action="store_true", help="delete the selected caches; default is dry run")
     gc_p.add_argument("--json", action="store_true")
     gc_p.set_defaults(func=cmd_gc)
+
+    run_p = sub.add_parser("run", help="run a foreground command while protecting its cache from eviction")
+    run_p.add_argument("--base-dir")
+    run_p.add_argument("--cache-path")
+    run_p.add_argument("name_arg", nargs="?")
+    run_p.add_argument("program", nargs=argparse.REMAINDER)
+    run_p.set_defaults(func=cmd_run)
+
+    doctor_p = sub.add_parser("doctor", help="check Linux, memfd, proc access, locks and resource limits")
+    doctor_p.add_argument("--base-dir")
+    doctor_p.add_argument("--json", action="store_true")
+    doctor_p.set_defaults(func=cmd_doctor)
 
     list_p = sub.add_parser("list", help="list active resident caches")
     list_p.add_argument("--base-dir")
@@ -1007,6 +1119,7 @@ def build_parser() -> argparse.ArgumentParser:
     stop_p.add_argument("--base-dir")
     stop_p.add_argument("--timeout", type=float, default=5.0)
     stop_p.add_argument("--remove-view", action="store_true")
+    stop_p.add_argument("--force", action="store_true", help="stop even when commands hold active leases")
     stop_p.set_defaults(func=cmd_stop)
 
     bench_p = sub.add_parser("bench", help="sequential read benchmark")
@@ -1036,8 +1149,14 @@ def main(argv: list[str] | None = None) -> int:
             if value is not None and value <= 0:
                 raise ValueError(f"{attribute} must be positive")
         for attribute in ("name", "name_arg"):
+            if args.command == "run" and getattr(args, "cache_path", None) and attribute == "name_arg":
+                continue
             if getattr(args, attribute, None):
                 validate_name(getattr(args, attribute))
+        for attribute in ("idle_ttl", "max_memory_bytes", "max_resident_bytes"):
+            value = getattr(args, attribute, None)
+            if value is not None and value <= 0:
+                raise ValueError(f"{attribute} must be positive")
         return int(args.func(args))
     except KeyboardInterrupt:
         return 130
