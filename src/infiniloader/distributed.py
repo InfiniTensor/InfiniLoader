@@ -6,12 +6,14 @@ import os
 import shutil
 import struct
 import time
+import queue as queue_module
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .cache import DEFAULT_EXCLUDES, collect_source_files, human_bytes
 from .paths import dist_view_root
+from .runtime import validate_name
 
 
 DTYPE_BYTES = {
@@ -57,6 +59,8 @@ def parse_safetensors_header(path: Path) -> dict[str, Any]:
         if len(raw_len) != 8:
             raise ValueError(f"{path} is too small to be safetensors")
         (header_len,) = struct.unpack("<Q", raw_len)
+        if header_len > 100 * 1024 * 1024 or header_len > path.stat().st_size - 8:
+            raise ValueError(f"invalid safetensors header length: {path}")
         header = f.read(header_len)
     return json.loads(header.decode("utf-8"))
 
@@ -149,6 +153,8 @@ def infer_tp_split(tensor: TensorInfo, tp: int) -> dict[str, Any]:
 
 
 def build_tp_plan(model_dir: Path, tp: int) -> dict[str, Any]:
+    if tp < 1:
+        raise ValueError("tp must be positive")
     tensors = collect_safetensors_metadata(model_dir)
     planned = [infer_tp_split(tensor, tp) for tensor in tensors]
     split = [item for item in planned if item["action"] == "split"]
@@ -201,6 +207,9 @@ def create_rank_views(
     base_dir: str | os.PathLike[str] | None = None,
     replace: bool = False,
 ) -> dict[str, Any]:
+    validate_name(name)
+    if ranks < 1:
+        raise ValueError("ranks must be positive")
     source = source.expanduser().resolve()
     if not source.is_dir():
         raise NotADirectoryError(source)
@@ -260,7 +269,7 @@ def _read_files_worker(rank: int, root: str, include_patterns: tuple[str, ...], 
         path = Path(root)
         files = collect_source_files(path, include_patterns, exclude_patterns)
         total = sum(item.size for item in files)
-        barrier.wait()
+        barrier.wait(timeout=30)
         start = time.perf_counter()
         read_bytes = 0
         for item in files:
@@ -271,8 +280,11 @@ def _read_files_worker(rank: int, root: str, include_patterns: tuple[str, ...], 
                         break
                     read_bytes += len(data)
         elapsed = time.perf_counter() - start
+        if read_bytes != total:
+            raise IOError(f"read {read_bytes} bytes, expected {total}")
         queue.put({"rank": rank, "path": root, "bytes": read_bytes, "expected_bytes": total, "seconds": elapsed, "ok": True})
     except Exception as exc:
+        barrier.abort()
         queue.put({"rank": rank, "path": root, "ok": False, "error": str(exc)})
 
 
@@ -284,7 +296,10 @@ def simulate_distributed_read(
     include_patterns: tuple[str, ...] = ("*.safetensors",),
     exclude_patterns: tuple[str, ...] = DEFAULT_EXCLUDES,
     chunk_size: int = 64 * 1024 * 1024,
+    timeout: float = 60.0,
 ) -> dict[str, Any]:
+    if ranks < 1 or chunk_size <= 0 or timeout <= 0:
+        raise ValueError("ranks, chunk_size and timeout must be positive")
     roots = []
     if rank_view_root:
         for rank in range(ranks):
@@ -301,11 +316,41 @@ def simulate_distributed_read(
         for rank in range(ranks)
     ]
     start = time.perf_counter()
-    for proc in processes:
-        proc.start()
-    rows = [queue.get() for _ in processes]
-    for proc in processes:
-        proc.join()
+    rows = []
+    try:
+        for proc in processes:
+            proc.start()
+        deadline = time.monotonic() + timeout
+        while len(rows) < ranks:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                row = queue.get(timeout=min(remaining, .1))
+                rows.append(row)
+                if not row.get("ok"):
+                    break
+            except queue_module.Empty:
+                if any(proc.exitcode not in (None, 0) for proc in processes):
+                    break
+        received = {row["rank"] for row in rows}
+        for rank in range(ranks):
+            if rank not in received:
+                rows.append({"rank": rank, "ok": False, "error": "rank failed, timed out or was cancelled"})
+    finally:
+        barrier.abort()
+        for proc in processes:
+            if proc.pid is None:
+                continue
+            proc.join(timeout=.2)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=1)
+        queue.close()
+        queue.cancel_join_thread()
     elapsed = time.perf_counter() - start
     ok = all(row.get("ok") for row in rows)
     aggregate_bytes = sum(row.get("bytes", 0) for row in rows)
