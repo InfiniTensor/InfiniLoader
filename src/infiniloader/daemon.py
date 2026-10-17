@@ -12,9 +12,10 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .cache import CachedModel, build_view, human_bytes, load_model_into_memory, source_identity, _safe_remove_view
+from .cache import CachedModel, build_view, human_bytes, load_model_into_memory, source_identity, _safe_remove_view, collect_source_files
 from .runtime import FileLock, atomic_json, process_token
 from .local_cache import lease_path, verify_cache
+from .memory import ResidentReservation
 
 
 class WeightLoaderDaemon:
@@ -38,6 +39,9 @@ class WeightLoaderDaemon:
         workers: int,
         quiet: bool = False,
         identity: dict | None = None,
+        max_memory_bytes: int | None = None,
+        reserve_bytes: int = 256 * 1024 * 1024,
+        max_resident_bytes: int | None = None,
     ) -> None:
         self.name = name
         self.source = source
@@ -58,6 +62,9 @@ class WeightLoaderDaemon:
         self.identity = identity or {}
         self.process_token = process_token(os.getpid())
         self._owns_runtime = False
+        self.max_memory_bytes, self.reserve_bytes = max_memory_bytes, reserve_bytes
+        self.max_resident_bytes = max_resident_bytes
+        self._reservation = None
         self.cached: CachedModel | None = None
         self.started_at = time.time()
         self.load_started_at: float | None = None
@@ -118,6 +125,8 @@ class WeightLoaderDaemon:
             progress=self._progress,
             chunk_size=self.chunk_size,
             workers=self.workers,
+            max_memory_bytes=self.max_memory_bytes,
+            reserve_bytes=self.reserve_bytes,
         )
         self.load_finished_at = time.time()
         build_view(self.cached, self.view, replace=self.replace)
@@ -161,6 +170,9 @@ class WeightLoaderDaemon:
             "include_patterns": list(self.include_patterns),
             "exclude_patterns": list(self.exclude_patterns),
             "workers": self.workers,
+            "memory_budget": self._reservation.info if self._reservation else None,
+            "sealed": True,
+            "physical_residency_guaranteed": False,
         }
 
     def _handle(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -251,6 +263,15 @@ class WeightLoaderDaemon:
                 locks.enter_context(FileLock(lease_path(self.local_cache_path), shared=True))
                 if not verify_cache(self.local_cache_path, full=False)["valid"]:
                     raise RuntimeError("local cache changed or was removed before daemon startup")
+            files = collect_source_files(self.source, self.include_patterns, self.exclude_patterns)
+            if not files:
+                raise RuntimeError("no files selected")
+            total = sum(f.size for f in files)
+            buffers = min(self.workers, len(files)) * min(self.chunk_size, max(f.size for f in files))
+            self._reservation = locks.enter_context(ResidentReservation(
+                self.socket_path.parent, self.name, total, buffers,
+                max_resident_bytes=self.max_resident_bytes, fraction=self.max_memory_fraction,
+                max_bytes=self.max_memory_bytes, reserve_bytes=self.reserve_bytes, force=self.force))
             self._owns_runtime = True
             try:
                 return self._serve_owned()
@@ -274,6 +295,7 @@ class WeightLoaderDaemon:
 
         try:
             self.load()
+            self._reservation.ready()
             if source_identity(self.upstream_source or self.source, self.include_patterns, self.exclude_patterns) != self.identity:
                 raise RuntimeError("source model changed during startup; stop and retry")
 
