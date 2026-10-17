@@ -2,6 +2,24 @@
 
 [中文](README.zh-CN.md)
 
+The development branch adds model identity checks, single-owner startup, sealed
+memfd files, versioned disk caches, container-aware budgets, and lease-aware cache
+management. See [operations and migration](docs/operations.md) for `doctor`,
+`verify`, `run`, `gc`, and container guidance.
+
+```bash
+iloader doctor
+iloader start "$MODEL" --name dev --local-cache \
+  --max-memory-bytes 32GiB --reserve-bytes 4GiB --max-resident-bytes 64GiB
+iloader run dev -- vllm serve '{model}'
+iloader gc --resident --max-bytes 32GiB       # preview
+iloader gc --resident --max-bytes 32GiB --apply
+```
+
+Use `iloader cache` plus `iloader run --cache-path PATH -- COMMAND` for disk-only
+caching. Existing direct-path readers remain supported; eviction protection requires
+`run`, so leave automatic idle eviction disabled for unregistered readers.
+
 `InfiniLoader` is a userspace weight loading manager for LLM inference
 framework development. It is designed for the loop where you repeatedly restart
 vLLM, SGLang, InfiniLM, or a custom engine while debugging loader, kernel,
