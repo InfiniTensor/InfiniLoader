@@ -94,6 +94,8 @@ class WeightLoaderDaemon:
         state.setdefault("started_at", self.started_at)
         state.setdefault("identity", self.identity)
         state.setdefault("process_token", self.process_token)
+        state.setdefault("idle_ttl", self.idle_ttl)
+        state.setdefault("memory_budget", self._reservation.info if self._reservation else None)
         atomic_json(self.state_path, state)
 
     def _progress(self, copied: int, total: int, rel: Path) -> None:

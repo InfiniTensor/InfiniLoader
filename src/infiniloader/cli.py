@@ -308,6 +308,10 @@ def _require_identity(args: argparse.Namespace, status: dict) -> None:
         raise RuntimeError("stop the running cache before requesting --refresh-cache")
     if args.idle_ttl is not None and status.get("idle_ttl") != args.idle_ttl:
         raise RuntimeError("stop the running cache before changing --idle-ttl")
+    for option in ("max_memory_bytes", "max_resident_bytes"):
+        requested = getattr(args, option, None)
+        if requested is not None and (status.get("memory_budget") or {}).get(option) != requested:
+            raise RuntimeError(f"stop the running cache before changing --{option.replace('_', '-')}")
 
 
 def _start_locked(args: argparse.Namespace) -> int:
@@ -413,6 +417,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         if status.get("load_seconds") is not None:
             print(f"load:   {status['load_seconds']:.3f}s")
         print(f"uptime: {status['uptime_seconds']:.1f}s")
+        print(f"leases: {status.get('active_leases', 0)}; reuse requests: {status.get('reuse_requests', 0)}")
+        print(f"sealed: {status.get('sealed', False)}; physical residency guaranteed: {status.get('physical_residency_guaranteed', False)}")
     return 0
 
 
@@ -500,6 +506,11 @@ def _stop_one(args: argparse.Namespace) -> int:
             return 1
         signal_owned_process(int(starting["pid"]), starting.get("process_token"))
         if args.remove_view:
+            deadline = time.monotonic() + args.timeout
+            while process_matches(int(starting["pid"]), starting.get("process_token")):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("daemon has not exited; view was preserved")
+                time.sleep(.05)
             view = Path(starting["view"])
             if view.exists():
                 _safe_remove_view(view, expected_pid=int(starting["pid"]))
@@ -619,6 +630,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_gc(args: argparse.Namespace) -> int:
+    if args.max_bytes is not None and args.max_bytes < 0 or args.ttl is not None and args.ttl < 0:
+        raise ValueError("max-bytes and ttl must be non-negative")
+    if args.resident and args.cache_root:
+        raise ValueError("--cache-root applies to disk caches; use --base-dir for resident caches")
     data = _gc_resident(args) if args.resident else garbage_collect(
         cache_root=args.cache_root, base_dir=args.base_dir,
         max_bytes=args.max_bytes, ttl=args.ttl, apply=args.apply)
@@ -753,7 +768,7 @@ BASH_COMPLETION = r'''_iloader_complete() {
   sub="${COMP_WORDS[1]}"
   case "${sub}" in
     start)
-      opts="--name --view --socket --pid-file --base-dir --log-file --pattern --exclude --force --no-wait --wait-timeout --chunk-size --workers --max-memory-fraction --local-cache --cache-root --cache-name --refresh-cache --cache-workers --help"
+      opts="--name --view --socket --pid-file --base-dir --log-file --pattern --exclude --force --no-wait --wait-timeout --chunk-size --workers --max-memory-fraction --max-memory-bytes --max-resident-bytes --reserve-bytes --idle-ttl --local-cache --cache-root --cache-name --refresh-cache --cache-workers --help"
       ;;
     list)
       opts="--base-dir --timeout --json --names-only --help"
@@ -762,7 +777,7 @@ BASH_COMPLETION = r'''_iloader_complete() {
       opts="--name --socket --base-dir --timeout --json --help"
       ;;
     stop)
-      opts="--name --all --socket --base-dir --timeout --remove-view --help"
+      opts="--name --all --socket --base-dir --timeout --remove-view --force --help"
       ;;
     cache|cache-status)
       opts="--name --cache-name --cache-root --base-dir --pattern --exclude --refresh --cache-workers --chunk-size --quiet --json --help"
@@ -770,11 +785,23 @@ BASH_COMPLETION = r'''_iloader_complete() {
     cache-list)
       opts="--cache-root --base-dir --json --help"
       ;;
+    verify)
+      opts="--quick --json --help"
+      ;;
+    gc)
+      opts="--base-dir --cache-root --max-bytes --ttl --resident --apply --json --help"
+      ;;
+    run)
+      opts="--base-dir --cache-path --help"
+      ;;
+    doctor)
+      opts="--base-dir --json --help"
+      ;;
     dist-views)
       opts="--name --ranks --base-dir --replace --json --help"
       ;;
     dist-simulate)
-      opts="--ranks --rank-view-root --pattern --exclude --chunk-size --json --help"
+      opts="--ranks --rank-view-root --pattern --exclude --chunk-size --timeout --json --help"
       ;;
     dist-plan)
       opts="--tp --limit --json --help"

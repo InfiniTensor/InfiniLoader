@@ -388,8 +388,8 @@ def build_view(cached: CachedModel, view_path: Path, replace: bool = False) -> P
     view_path = view_path.expanduser().absolute()
     if view_path.is_symlink():
         raise RuntimeError("view path must not be a symlink")
-    if view_path == cached.source_root:
-        raise RuntimeError("view path must be different from source model path")
+    if view_path.resolve().is_relative_to(cached.source_root) or cached.source_root.is_relative_to(view_path.resolve()):
+        raise RuntimeError("view and source model directories must not overlap")
     parent = view_path.parent
     parent.mkdir(parents=True, exist_ok=True)
 

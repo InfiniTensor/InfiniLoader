@@ -77,3 +77,18 @@ def test_verify_rejects_manifest_traversal(tmp_path):
     manifest["cached_files"][0]["relative_path"] = "../outside"
     atomic_json(manifest_file, manifest)
     assert not verify_cache(local.cache_path)["valid"]
+
+
+def test_full_verify_checks_content_even_if_metadata_matches_manifest(tmp_path):
+    local = materialize_model_cache(make_model_dir(tmp_path / "model"), base_dir=tmp_path / "state")
+    manifest_file = local.cache_path / ".iloader-cache/manifest.json"
+    manifest = json.loads(manifest_file.read_text())
+    item = manifest["cached_files"][0]
+    file = local.cache_path / item["relative_path"]
+    file.chmod(0o644)
+    file.write_bytes(b"X" * item["size"])
+    current = file.stat()
+    item.update(mtime_ns=current.st_mtime_ns, ctime_ns=current.st_ctime_ns)
+    atomic_json(manifest_file, manifest)
+    assert verify_cache(local.cache_path, full=False)["valid"]
+    assert any("SHA-256 mismatch" in error for error in verify_cache(local.cache_path)["errors"])

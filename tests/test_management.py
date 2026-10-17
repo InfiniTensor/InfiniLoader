@@ -17,10 +17,10 @@ pytestmark = pytest.mark.skipif(not hasattr(os, "memfd_create"), reason="Linux m
 
 def test_leases_protect_stop_gc_and_idle_ttl(tmp_path):
     model = make_model_dir(tmp_path / "model")
-    with running_daemon(tmp_path, model, extra=["--idle-ttl", ".2"]) as (proc, state):
+    with running_daemon(tmp_path, model, extra=["--idle-ttl", "2"]) as (proc, state):
         sock = state / "run/unit.sock"
         lease = request(sock, {"command": "lease-acquire", "pid": os.getpid(), "process_token": process_token(os.getpid())})
-        time.sleep(1.1)
+        time.sleep(2.1)
         assert request(sock, {"command": "status"})["status"]["active_leases"] == 1
         assert main(["stop", "unit", "--base-dir", str(state)]) == 1
         assert main(["gc", "--resident", "--base-dir", str(state), "--max-bytes", "0", "--apply"]) == 1

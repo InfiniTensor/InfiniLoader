@@ -7,13 +7,14 @@ import shutil
 import struct
 import time
 import queue as queue_module
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .cache import DEFAULT_EXCLUDES, collect_source_files, human_bytes
 from .paths import dist_view_root
-from .runtime import validate_name
+from .runtime import validate_name, read_json
 
 
 DTYPE_BYTES = {
@@ -185,8 +186,8 @@ def build_tp_plan(model_dir: Path, tp: int) -> dict[str, Any]:
 def _safe_remove_dist_view(path: Path) -> None:
     if not path.exists() and not path.is_symlink():
         return
-    marker = path / ".iloader-dist" / "manifest.json"
-    if not marker.exists() and ".tmp." not in path.name:
+    marker = read_json(path / ".iloader-dist" / "manifest.json")
+    if path.is_symlink() or not marker or marker.get("mode") != "full-hf-compatible":
         raise RuntimeError(f"refusing to remove non-InfiniLoader distributed view {path}")
     shutil.rmtree(path)
 
@@ -214,15 +215,10 @@ def create_rank_views(
     if not source.is_dir():
         raise NotADirectoryError(source)
     root = dist_view_root(base_dir) / name
-    if root.exists():
-        if not replace:
-            raise FileExistsError(f"{root} already exists; pass --replace")
-        _safe_remove_dist_view(root)
-    tmp = root.parent / f".{root.name}.tmp.{os.getpid()}"
-    _safe_remove_dist_view(tmp)
-    tmp.mkdir(parents=True)
-
+    if root.resolve().is_relative_to(source) or source.is_relative_to(root.resolve()):
+        raise RuntimeError("distributed view and source directories must not overlap")
     files = collect_source_files(source, (), DEFAULT_EXCLUDES)
+    tmp = Path(tempfile.mkdtemp(prefix=f".{root.name}.tmp.", dir=root.parent))
     try:
         for rank in range(ranks):
             rank_dir = tmp / f"rank{rank}"
@@ -256,11 +252,15 @@ def create_rank_views(
             "total_human": human_bytes(sum(item.size for item in files)),
         }
         (root_marker / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        if root.exists() or root.is_symlink():
+            if not replace:
+                raise FileExistsError(f"{root} already exists; pass --replace")
+            _safe_remove_dist_view(root)
         os.replace(tmp, root)
         manifest["rank_paths"] = [str((root / f"rank{rank}").resolve()) for rank in range(ranks)]
         return manifest
     except Exception:
-        _safe_remove_dist_view(tmp)
+        shutil.rmtree(tmp)
         raise
 
 

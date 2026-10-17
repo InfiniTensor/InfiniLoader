@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 from .runtime import validate_name
 
@@ -11,10 +12,8 @@ APP_DIR_NAME = "infiniloader"
 def _writable_dir(path: Path) -> bool:
     try:
         path.mkdir(parents=True, exist_ok=True)
-        probe = path / ".write-test"
-        with probe.open("w", encoding="utf-8") as f:
-            f.write("ok")
-        probe.unlink(missing_ok=True)
+        with tempfile.TemporaryFile(dir=path) as f:
+            f.write(b"ok")
         return True
     except OSError:
         return False
@@ -36,8 +35,8 @@ def default_base_dir() -> Path:
     for candidate in candidates:
         if _writable_dir(candidate):
             return candidate
-    fallback = Path(os.environ.get("TMPDIR", "/tmp")) / APP_DIR_NAME
-    fallback.mkdir(parents=True, exist_ok=True)
+    fallback = Path(os.environ.get("TMPDIR", "/tmp")) / f"{APP_DIR_NAME}-{os.getuid()}"
+    fallback.mkdir(parents=True, exist_ok=True, mode=0o700)
     return fallback
 
 
