@@ -66,3 +66,14 @@ def test_every_switch_needs_one_output_and_legal_small_world():
                        {"tp": 1, "pp": 1, "output": None}]}]
     with pytest.raises(RuntimeError, match="exactly one"):
         mlp.validate_outputs(rows)
+
+
+def test_startup_barrier_rejects_missing_and_mixed_versions(tmp_path):
+    with pytest.raises(TimeoutError):
+        mlp.publish_start(tmp_path, 2, "plan", .01)
+    for rank in range(2):
+        (tmp_path / f"ready{rank}.json").write_text(__import__("json").dumps({
+            "rank": rank, "plan_id": "wrong" if rank else "plan", "nonce": str(rank)}))
+    with pytest.raises(ValueError, match="mixed"):
+        mlp.publish_start(tmp_path, 2, "plan", .1)
+    assert not (tmp_path / "start.json").exists()

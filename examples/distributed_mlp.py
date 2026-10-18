@@ -15,11 +15,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 from infiniloader.cache import build_view, load_model_into_memory
 from infiniloader.shards import build_plan, canonical, digest, export_rank, read_json
 from infiniloader.torch_store import TensorStore
+from infiniloader.runtime import atomic_json, process_token
 
 DIM, HIDDEN, LAYERS = 32, 64, 4
 
@@ -102,6 +104,51 @@ def memory():
     return result
 
 
+def publish_start(directory: Path, world: int, plan_id: str, timeout: float):
+    """Controller-side release after every independently launched rank is ready."""
+    deadline = time.monotonic() + timeout
+    paths = [directory / f"ready{r}.json" for r in range(world)]
+    while not all(p.exists() for p in paths):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("not every rank reached the startup barrier")
+        time.sleep(.05)
+    rows = [read_json(p) for p in paths]
+    if any(r.get("rank") != i or r.get("plan_id") != plan_id or not isinstance(r.get("nonce"), str)
+           for i, r in enumerate(rows)) or len({r["nonce"] for r in rows}) != world:
+        raise ValueError("mixed versions/ranks at startup barrier")
+    marker = directory / "start.json"
+    if marker.exists():
+        raise FileExistsError("startup barrier was already released")
+    atomic_json(marker, {"format": 1, "plan_id": plan_id,
+                         "participants": {str(r["rank"]): r["nonce"] for r in rows}})
+    return rows
+
+
+def wait_start(directory: Path, rank: int, world: int, plan_id: str, timeout: float):
+    if not directory.is_dir() or directory.is_symlink():
+        raise ValueError("startup barrier requires a fresh shared directory")
+    ready = {"rank": rank, "plan_id": plan_id, "nonce": uuid.uuid4().hex,
+             "hostname": socket.gethostname(), "pid": os.getpid(), "process_token": process_token(os.getpid())}
+    path = directory / f"ready{rank}.json"
+    # Each operation uses a fresh barrier; never join stale readiness records.
+    if path.exists():
+        raise FileExistsError(path)
+    atomic_json(path, ready)
+    deadline = time.monotonic() + timeout
+    while True:
+        marker = directory / "start.json"
+        if marker.exists():
+            start = read_json(marker)
+            if (start.get("format") != 1 or start.get("plan_id") != plan_id
+                    or set(start.get("participants", {})) != {str(r) for r in range(world)}
+                    or start["participants"].get(str(rank)) != ready["nonce"]):
+                raise ValueError("stale or mismatched startup release")
+            return ready
+        if time.monotonic() >= deadline:
+            raise TimeoutError("controller did not release startup barrier")
+        time.sleep(.05)
+
+
 def execute(store, rule, rank, device):
     import torch
     import torch.distributed as dist
@@ -136,6 +183,10 @@ def worker(args):
     torch.set_num_threads(1)
     if args.device != "cpu":
         torch.cuda.set_device(torch.device(args.device))
+        # Finish device runtime startup before reporting readiness to the controller.
+        warmup = torch.zeros(1, device=args.device)
+        torch.cuda.synchronize()
+        del warmup
     meta = read_json(args.root / "fixture.json")
     if meta.get("kind") != "generated-mlp":
         raise ValueError("only generated fixture directories may be used")
@@ -143,8 +194,6 @@ def worker(args):
     source = args.root / f"rank{args.rank}"
     if (source / "weights.safetensors.offline").exists():
         raise ValueError("fixture already consumed; prepare a fresh one")
-    dist.init_process_group(args.backend, init_method=args.init, rank=args.rank,
-                            world_size=args.world_size, timeout=datetime.timedelta(seconds=args.timeout))
     with tempfile.TemporaryDirectory(prefix="iloader-mlp-") as temp:
         model, store = None, None
         try:
@@ -164,6 +213,10 @@ def worker(args):
                     "canonical_tensor_bytes": store.catalog["tensor_bytes"],
                     "resident_file_bytes": model.total_bytes, "preload_seconds": time.perf_counter() - start,
                     "memory_after_map": memory(), "source_available": False}
+            if args.ready_dir:
+                info["startup"] = wait_start(args.ready_dir, args.rank, args.world_size, plan["plan_id"], args.timeout)
+            dist.init_process_group(args.backend, init_method=args.init, rank=args.rank,
+                                    world_size=args.world_size, timeout=datetime.timedelta(seconds=args.timeout))
             identities = [None] * args.world_size
             dist.all_gather_object(identities, (store.content_id, plan["plan_id"]))
             if len(set(identities)) != 1 or args.world_size != len(plan["ranks"]):
@@ -188,7 +241,8 @@ def worker(args):
                 store.close()
             if model is not None:
                 model.close()
-            dist.destroy_process_group()
+            if dist.is_initialized():
+                dist.destroy_process_group()
 
 
 def run_local(args):
@@ -196,6 +250,8 @@ def run_local(args):
     root = args.root
     plan = prepare(root, args.mode, args.tp, args.pp)
     world = args.tp * args.pp
+    barrier = root / "startup"
+    barrier.mkdir()
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
@@ -210,9 +266,16 @@ def run_local(args):
                    "--rank", str(rank), "--world-size", str(world), "--init", f"tcp://127.0.0.1:{port}",
                    "--backend", args.backend, "--device", args.device, "--output", str(output),
                    "--timeout", str(args.timeout)]
+            cmd.extend(["--ready-dir", str(barrier)])
             if args.mode == "replicated":
                 cmd.append("--switch")
             processes.append(subprocess.Popen(cmd, stdout=log, stderr=log))
+        try:
+            publish_start(barrier, world, plan["plan_id"], args.timeout)
+        except TimeoutError:
+            if any(p.poll() not in (None, 0) for p in processes):
+                raise RuntimeError(f"worker failed before startup; inspect {root}/worker*.log") from None
+            raise
         deadline = time.monotonic() + args.timeout + 20
         for p in processes:
             p.wait(timeout=max(.1, deadline - time.monotonic()))
@@ -259,6 +322,7 @@ def main():
             p.add_argument("--world-size", type=int, required=True)
             p.add_argument("--init", required=True)
             p.add_argument("--switch", action="store_true")
+            p.add_argument("--ready-dir", type=Path, help="wait for controller release after all ranks preload")
     args = parser.parse_args()
     if args.action == "prepare":
         print(json.dumps(prepare(args.root, args.mode, args.tp, args.pp), indent=2))
