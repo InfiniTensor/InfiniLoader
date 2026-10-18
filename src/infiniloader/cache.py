@@ -228,6 +228,7 @@ def _copy_with_read_write(src_fd: int, dst_fd: int, size: int, chunk_size: int) 
             written = os.write(dst_fd, view)
             view = view[written:]
         copied += len(data)
+        del view, data
     return copied
 
 
@@ -271,8 +272,15 @@ def copy_file_to_memfd(source: SourceFile, chunk_size: int = 64 * 1024 * 1024) -
 
         os.lseek(dst_fd, 0, os.SEEK_SET)
         # Hash only a small prefix for diagnostics; full hashing doubles load time.
-        prefix = os.read(dst_fd, min(source.size, 1024 * 1024))
-        digest = hashlib.sha256(prefix)
+        digest = hashlib.sha256()
+        remaining = min(source.size, 1024 * 1024)
+        while remaining:
+            data = os.read(dst_fd, min(chunk_size, remaining))
+            if not data:
+                raise IOError("short read while hashing cached prefix")
+            digest.update(data)
+            remaining -= len(data)
+            del data
         os.lseek(dst_fd, 0, os.SEEK_SET)
         os.ftruncate(dst_fd, source.size)
         fcntl.fcntl(dst_fd, fcntl.F_ADD_SEALS,

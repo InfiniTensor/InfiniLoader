@@ -12,6 +12,7 @@ import tempfile
 import time
 from typing import Callable
 import uuid
+import math
 
 from .cache import DEFAULT_EXCLUDES, SourceFile, collect_source_files, human_bytes
 from .paths import model_cache_root
@@ -93,11 +94,37 @@ def verify_cache(cache_path: Path, *, full: bool = True) -> dict:
     errors, checked = [], 0
     if cache_path.is_symlink() or not manifest or manifest.get("format_version") != 2:
         errors.append("not a version-2 InfiniLoader disk cache; rebuild legacy caches to verify")
+    elif (not isinstance(manifest.get("source_root"), str)
+          or type(manifest.get("file_count")) is not int or manifest["file_count"] < 1
+          or type(manifest.get("total_bytes")) is not int or manifest["total_bytes"] < 0):
+        errors.append("invalid cache manifest metadata")
     else:
         records = manifest.get("cached_files")
-        if not isinstance(records, list) or len(records) != manifest.get("file_count"):
+        if (not isinstance(records, list) or not records or len(records) != manifest.get("file_count")
+                or not all(isinstance(item, dict) for item in records)):
             errors.append("incomplete file manifest")
         else:
+            names = [item.get("relative_path") for item in records]
+            if (any(type(item.get("size")) is not int or item["size"] < 0 for item in records)
+                    or sum(item["size"] for item in records) != manifest["total_bytes"]):
+                errors.append("cached file sizes do not match total_bytes")
+            source_records = manifest.get("files")
+            source_names = [item.get("relative_path") for item in source_records if isinstance(item, dict)] if isinstance(source_records, list) else []
+            if (not all(isinstance(name, str) for name in names) or len(set(names)) != len(names)
+                    or not isinstance(source_records, list)
+                    or not all(isinstance(item, dict) for item in source_records)
+                    or not all(isinstance(name, str) for name in source_names)
+                    or sorted(names) != sorted(source_names)):
+                errors.append("file manifest names are missing, duplicated or inconsistent")
+                return dict(cache_path=str(cache_path), valid=False, full=full, checked_files=0, errors=errors)
+            try:
+                actual = {path.relative_to(cache_path).as_posix() for path in cache_path.rglob("*")
+                          if path.is_symlink() or not path.is_dir()}
+                expected = set(names) | {".iloader-cache/manifest.json"}
+                if actual != expected:
+                    errors.append(f"generation file set changed: extra={sorted(actual - expected)}, missing={sorted(expected - actual)}")
+            except OSError as exc:
+                errors.append(f"cannot inventory generation: {exc}")
             for item in records:
                 try:
                     file = _safe_file(cache_path, item["relative_path"])
@@ -116,6 +143,15 @@ def verify_cache(cache_path: Path, *, full: bool = True) -> dict:
     return dict(cache_path=str(cache_path), valid=not errors, full=full, checked_files=checked, errors=errors)
 
 
+def _created_at(path: Path) -> float:
+    value = (read_json(_manifest_path(path)) or {}).get("created_at", 0)
+    try:
+        parsed = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+        return parsed if math.isfinite(parsed) else 0.0
+    except (ValueError, OverflowError):
+        return 0.0
+
+
 def cache_is_valid(source_root, cache_path, files, include_patterns, exclude_patterns) -> bool:
     manifest = read_json(_manifest_path(cache_path))
     if not manifest or manifest.get("source_root") != str(source_root):
@@ -132,7 +168,7 @@ def cache_path_for(source_root: Path, *, name=None, cache_root=None, base_dir=No
     root = _root(cache_root, base_dir)
     prefix = f"{cache_key(source_root, name)}-{_revision(files, include_patterns, exclude_patterns)}"
     for candidate in sorted(root.glob(f"{prefix}*"),
-                            key=lambda p: (read_json(_manifest_path(p)) or {}).get("created_at", 0), reverse=True):
+                            key=_created_at, reverse=True):
         if cache_is_valid(source_root, candidate, files, include_patterns, exclude_patterns):
             return candidate
     return root / prefix
@@ -158,6 +194,7 @@ def _copy_one(item: SourceFile, cache_path: Path, chunk_size: int) -> dict:
                     raise IOError(f"short write: {dst}")
                 remaining = remaining[written:]
             copied += len(data)
+            del remaining, data
         after = os.fstat(src.fileno())
         if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise RuntimeError(f"source changed during cache copy: {item.path}")
@@ -240,11 +277,17 @@ def list_model_caches(*, cache_root=None, base_dir=None) -> list[dict]:
         if not manifest or manifest.get("format_version") not in (1, 2):
             continue
         usage = read_json(root / ".usage" / f"{path.name}.json") or {}
-        total = manifest.get("total_bytes", 0)
+        # Collection accounts actual model files, even when a damaged manifest lies
+        # about total_bytes or extra files have appeared after publication.
+        try:
+            total = sum(file.lstat().st_size for file in path.rglob("*")
+                        if file.is_file() and not file.is_symlink() and file != _manifest_path(path))
+        except OSError:
+            continue
         rows.append(dict(cache_path=str(path), source_root=manifest.get("source_root"),
                          file_count=manifest.get("file_count"), total_bytes=total, total_human=human_bytes(total),
-                         format_version=manifest["format_version"], created_at=manifest.get("created_at", 0),
-                         last_used_at=usage.get("last_used_at", manifest.get("created_at", 0))))
+                         format_version=manifest["format_version"], created_at=_created_at(path),
+                         last_used_at=usage.get("last_used_at", _created_at(path))))
     return rows
 
 
