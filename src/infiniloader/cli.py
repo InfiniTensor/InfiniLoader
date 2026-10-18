@@ -504,6 +504,8 @@ def _stop_one(args: argparse.Namespace) -> int:
         if not starting:
             print(f"{args.name}: {exc}", file=sys.stderr)
             return 1
+        if starting.get("state") not in ("starting", "loading") and not getattr(args, "force", False):
+            raise RuntimeError("ready daemon is unresponsive; no signal was sent, retry or use stop --force")
         signal_owned_process(int(starting["pid"]), starting.get("process_token"))
         if args.remove_view:
             deadline = time.monotonic() + args.timeout
@@ -541,7 +543,11 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 remove_view=args.remove_view,
                 force=getattr(args, "force", False),
             )
-            rc = max(rc, _stop_one(ns))
+            try:
+                rc = max(rc, _stop_one(ns))
+            except (RuntimeError, OSError, ValueError) as exc:
+                print(f"{row['name']}: {exc}", file=sys.stderr)
+                rc = max(rc, 1)
         return rc
     return _stop_one(args)
 

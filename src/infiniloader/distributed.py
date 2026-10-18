@@ -336,7 +336,8 @@ def simulate_distributed_read(
         received = {row["rank"] for row in rows}
         for rank in range(ranks):
             if rank not in received:
-                rows.append({"rank": rank, "ok": False, "error": "rank failed, timed out or was cancelled"})
+                rows.append({"rank": rank, "path": roots[rank], "ok": False,
+                             "error": "rank failed, timed out or was cancelled"})
     finally:
         barrier.abort()
         for proc in processes:

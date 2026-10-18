@@ -26,11 +26,15 @@ def read_json(path: Path) -> dict[str, Any] | None:
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
+    atomic_text(path, json.dumps(value, indent=2, sort_keys=True))
+
+
+def atomic_text(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, indent=2, sort_keys=True)
+            stream.write(value)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
