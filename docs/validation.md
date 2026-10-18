@@ -4,8 +4,9 @@ Date: 2026-10-18 (Asia/Shanghai). Baseline: `5014a6a` on upstream master.
 
 ## Local results
 
-- Ubuntu on WSL2, Linux 6.18.33.2, Python 3.14.4: **55 tests passed** in the final
-  full regression run (31.24 seconds). The baseline contained 17 tests.
+- Ubuntu on WSL2, Linux 6.18.33.2, Python 3.14.4: **77 tests passed** after independent
+  review fixes (25.92 seconds). The baseline contained 17 tests; the original nine
+  implementation commits ended with 55 passing tests.
 - Built `infiniloader-0.1.0-py3-none-any.whl` with Python 3.12.14/setuptools 84.0.0.
   The package version is unchanged; this branch has not been published as a release.
 - Executed `python -m infiniloader selftest` from the built wheel on Linux: passed
@@ -29,8 +30,10 @@ TTL while a lease is active, then verifies eviction after lease release.
 
 ## Scope and remaining validation
 
-The GitHub workflow defines Ubuntu jobs for Python 3.10-3.14; local validation above
-used Python 3.14.4, not the full matrix. Check the remote workflow after pushing.
+The original branch HEAD `6a33d83` passed the complete remote Ubuntu Python 3.10-3.14
+matrix in [Actions run 39101870656](https://github.com/InfiniTensor/InfiniLoader/actions/runs/39101870656).
+Check the newer branch workflow for the subsequent review fixes. Independent review
+and per-commit test details are recorded in [expert-review.md](expert-review.md).
 The Dockerfile is a non-root diagnostic image; Docker was unavailable locally, so
 the image was not built or exercised in this environment.
 

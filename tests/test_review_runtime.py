@@ -106,5 +106,3 @@ def test_dist_simulate_failure_text_has_all_paths(tmp_path, capsys):
     assert "rank 0: failed" in output.out
     assert "rank 1: failed" in output.out
     assert "error: 'path'" not in output.err
-
-
