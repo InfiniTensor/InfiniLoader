@@ -211,3 +211,65 @@ def test_reject_utf16_header_and_interior_empty_offsets(tmp_path):
     file.write_bytes(struct.pack("<Q", len(raw)) + raw + bytes(16))
     with pytest.raises(ValueError):
         tensor_header(file)
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="POSIX network filesystem fallback")
+def test_network_fs_publication_is_atomic_and_exclusive(tmp_path, monkeypatch):
+    import ctypes
+    import errno
+    from types import SimpleNamespace
+    import infiniloader.shards as shards
+    def unsupported(*args):
+        ctypes.set_errno(errno.EOPNOTSUPP)
+        return -1
+    monkeypatch.setattr(shards.ctypes, "CDLL", lambda *a, **k: SimpleNamespace(renameat2=unsupported))
+    source = tmp_path / "source"
+    write_tensor(source)
+    plan = build_plan(source, layout(0))
+    dest = tmp_path / "out"
+    export_rank(source, plan, 0, dest)
+    assert dest.is_symlink()
+    assert not dest.readlink().is_absolute()
+    assert verify_rank(dest)["rank"] == 0
+    # An existing empty directory must also survive on the fallback path.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(FileExistsError):
+        shards._publish_directory(dest.resolve(), empty)
+    assert empty.is_dir() and not list(empty.iterdir())
+    publish = shards._publish_directory
+    def interrupted(temp, destination):
+        publish(temp, destination)
+        raise KeyboardInterrupt()
+    monkeypatch.setattr(shards, "_publish_directory", interrupted)
+    interrupted_dest = tmp_path / "interrupted"
+    with pytest.raises(KeyboardInterrupt):
+        export_rank(source, plan, 1, interrupted_dest)
+    assert interrupted_dest.is_symlink()
+    assert verify_rank(interrupted_dest)["rank"] == 1
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="POSIX network filesystem fallback")
+def test_uncertain_published_path_is_preserved(tmp_path, monkeypatch):
+    import errno
+    import os
+    from pathlib import Path
+    import infiniloader.shards as shards
+    source = tmp_path / "source"
+    write_tensor(source)
+    plan = build_plan(source, layout(0))
+    dest = tmp_path / "out"
+    original_lstat = Path.lstat
+    def io_error(path, *args, **kwargs):
+        if path == dest:
+            raise OSError(errno.EIO, "injected uncertain NFS lookup")
+        return original_lstat(path, *args, **kwargs)
+    def uncertain(temp, destination):
+        os.symlink(temp.name, destination)
+        monkeypatch.setattr(Path, "lstat", io_error)
+        raise KeyboardInterrupt()
+    monkeypatch.setattr(shards, "_publish_directory", uncertain)
+    with pytest.raises(KeyboardInterrupt):
+        export_rank(source, plan, 0, dest)
+    monkeypatch.setattr(Path, "lstat", original_lstat)
+    assert verify_rank(dest)["rank"] == 0

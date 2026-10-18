@@ -12,6 +12,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import struct
 import tempfile
 from pathlib import Path
@@ -211,18 +212,21 @@ def _publish_directory(temp: Path, destination: Path):
     if os.name == "nt":
         os.rename(temp, destination)  # Windows rename never replaces a destination.
         return
-    # POSIX rename would replace a concurrently created empty directory. Fail closed
-    # if this Linux non-overwriting primitive is unavailable.
+    # POSIX rename would replace a concurrently created empty directory. Some NFS
+    # servers lack RENAME_NOREPLACE: publish a relative symlink to the complete,
+    # private staging directory instead. symlink creation is atomic and exclusive.
     libc = ctypes.CDLL(None, use_errno=True)
     rename = getattr(libc, "renameat2", None)
     if rename is None:
-        raise RuntimeError("atomic shard publication requires Linux renameat2")
+        os.symlink(temp.name, destination, target_is_directory=True)
+        return
     rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     rename.restype = ctypes.c_int
     if rename(-100, os.fsencode(temp), -100, os.fsencode(destination), 1):
         code = ctypes.get_errno()
         if code in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
-            raise RuntimeError("filesystem lacks atomic non-overwriting shard publication")
+            os.symlink(temp.name, destination, target_is_directory=True)
+            return
         raise OSError(code, os.strerror(code), destination)
 
 
@@ -275,7 +279,17 @@ def export_rank(source: Path, plan: dict, rank: int, destination: Path) -> dict:
         _publish_directory(temp, destination)
         return receipt
     except BaseException:
-        shutil.rmtree(temp)
+        # A signal can arrive just after successful symlink publication. Never
+        # remove a backing directory now reachable through the public rank path.
+        try:
+            published = (stat.S_ISLNK(destination.lstat().st_mode)
+                         and destination.readlink() == Path(temp.name))
+        except (FileNotFoundError, NotADirectoryError):
+            published = False
+        except OSError:
+            published = True  # Unknown publication result: preserve data.
+        if not published:
+            shutil.rmtree(temp, ignore_errors=True)
         raise
 
 
