@@ -15,9 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from .cache import CachedModel, build_view, human_bytes, load_model_into_memory, source_identity, _safe_remove_view, collect_source_files
-from .runtime import FileLock, atomic_json, atomic_text, process_token, process_matches, read_json
+from .runtime import FileLock, atomic_json, atomic_text, process_token, process_matches, read_json, validate_socket_path
 from .local_cache import lease_path, verify_cache
 from .memory import ResidentReservation
+from .paths import absolute_path
 
 
 class WeightLoaderDaemon:
@@ -47,13 +48,13 @@ class WeightLoaderDaemon:
         idle_ttl: float | None = None,
     ) -> None:
         self.name = name
-        self.source = source
-        self.view = view
-        self.socket_path = socket_path
-        self.pid_path = pid_path
-        self.state_path = state_path
-        self.upstream_source = upstream_source
-        self.local_cache_path = local_cache_path
+        self.source = absolute_path(source)
+        self.view = absolute_path(view)
+        self.socket_path = absolute_path(socket_path)
+        self.pid_path = absolute_path(pid_path)
+        self.state_path = absolute_path(state_path)
+        self.upstream_source = absolute_path(upstream_source) if upstream_source is not None else None
+        self.local_cache_path = absolute_path(local_cache_path) if local_cache_path is not None else None
         self.include_patterns = include_patterns
         self.exclude_patterns = exclude_patterns
         self.replace = replace
@@ -301,7 +302,7 @@ class WeightLoaderDaemon:
 
     def _check_runtime_paths(self) -> None:
         paths = (self.socket_path, self.pid_path, self.state_path)
-        if len({path.absolute() for path in paths}) != len(paths):
+        if len({path.resolve() for path in paths}) != len(paths):
             raise RuntimeError("socket, PID and state paths must be distinct")
         for path in paths:
             for source in (self.source, self.upstream_source):
@@ -358,6 +359,7 @@ class WeightLoaderDaemon:
         self._stop = True
 
     def serve_forever(self) -> int:
+        validate_socket_path(self.socket_path)
         with ExitStack() as locks:
             locks.enter_context(FileLock(self.socket_path.with_suffix(".owner.lock"), timeout=0))
             locks.enter_context(FileLock(self.view.parent / f".{self.view.name}.owner.lock", timeout=0))

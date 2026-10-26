@@ -15,7 +15,7 @@ import uuid
 import math
 
 from .cache import DEFAULT_EXCLUDES, SourceFile, collect_source_files, human_bytes
-from .paths import model_cache_root
+from .paths import absolute_path, default_base_dir
 from .runtime import FileLock, atomic_json, read_json
 
 
@@ -43,8 +43,11 @@ def cache_key(source_root: Path, name: str | None = None) -> str:
     return f"{_safe_name(name or source_root.name)}-{hashlib.sha256(str(source_root).encode()).hexdigest()[:12]}"
 
 
-def _root(cache_root=None, base_dir=None) -> Path:
-    root = Path(cache_root).expanduser().resolve() if cache_root else model_cache_root(base_dir).resolve()
+def _root(cache_root=None, base_dir=None, *, source_root: Path | None = None) -> Path:
+    base = absolute_path(base_dir) if base_dir else None
+    root = (Path(cache_root).expanduser() if cache_root else (base or default_base_dir()) / "model-cache").resolve()
+    if source_root is not None and root.is_relative_to(source_root.resolve()):
+        raise ValueError("disk cache directory must be outside the source model directory")
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -165,7 +168,7 @@ def cache_path_for(source_root: Path, *, name=None, cache_root=None, base_dir=No
                    include_patterns=(), exclude_patterns=DEFAULT_EXCLUDES) -> Path:
     source_root = source_root.expanduser().resolve()
     files = collect_source_files(source_root, include_patterns, exclude_patterns)
-    root = _root(cache_root, base_dir)
+    root = _root(cache_root, base_dir, source_root=source_root)
     prefix = f"{cache_key(source_root, name)}-{_revision(files, include_patterns, exclude_patterns)}"
     for candidate in sorted(root.glob(f"{prefix}*"),
                             key=_created_at, reverse=True):
@@ -214,7 +217,7 @@ def materialize_model_cache(source_root: Path, *, name=None, cache_root=None, ba
         raise ValueError("workers and chunk_size must be positive")
     start = time.perf_counter()
     source_root = source_root.expanduser().resolve()
-    root = _root(cache_root, base_dir)
+    root = _root(cache_root, base_dir, source_root=source_root)
     with FileLock(root / ".cache.lock", timeout=600):
         files = collect_source_files(source_root, include_patterns, exclude_patterns)
         if not files:

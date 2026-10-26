@@ -14,13 +14,14 @@ from pathlib import Path
 from . import __version__
 from .benchmark import benchmark_path
 from .cache import DEFAULT_EXCLUDES, build_view, human_bytes, inspect_source, load_model_into_memory, source_identity, _safe_remove_view
-from .runtime import FileLock, process_matches, process_token, read_json, signal_owned_process, validate_name
+from .runtime import FileLock, process_matches, process_token, read_json, signal_owned_process, validate_name, validate_socket_path
 from .memory import parse_bytes
 from .daemon import WeightLoaderDaemon
 from .distributed import build_tp_plan, create_rank_views, simulate_distributed_read
 from .ipc import LoaderConnectionError, request
 from .local_cache import cache_status, list_model_caches, materialize_model_cache, verify_cache, garbage_collect, lease_path, touch_cache
 from .paths import (
+    absolute_path,
     default_log_path,
     default_pid_path,
     default_socket_path,
@@ -41,19 +42,19 @@ def _print_json(data: object) -> None:
 
 
 def _socket(args: argparse.Namespace) -> Path:
-    return Path(args.socket).expanduser() if getattr(args, "socket", None) else default_socket_path(args.name, getattr(args, "base_dir", None))
+    return absolute_path(args.socket) if getattr(args, "socket", None) else default_socket_path(args.name, getattr(args, "base_dir", None))
 
 
 def _pid(args: argparse.Namespace) -> Path:
-    return Path(args.pid_file).expanduser() if getattr(args, "pid_file", None) else default_pid_path(args.name, getattr(args, "base_dir", None))
+    return absolute_path(args.pid_file) if getattr(args, "pid_file", None) else default_pid_path(args.name, getattr(args, "base_dir", None))
 
 
 def _state(args: argparse.Namespace) -> Path:
-    return Path(args.state_file).expanduser() if getattr(args, "state_file", None) else default_state_path(args.name, getattr(args, "base_dir", None))
+    return absolute_path(args.state_file) if getattr(args, "state_file", None) else default_state_path(args.name, getattr(args, "base_dir", None))
 
 
 def _view(args: argparse.Namespace) -> Path:
-    return Path(args.view).expanduser() if getattr(args, "view", None) else default_view_path(args.name, getattr(args, "base_dir", None))
+    return absolute_path(args.view) if getattr(args, "view", None) else default_view_path(args.name, getattr(args, "base_dir", None))
 
 
 def _resolve_name(args: argparse.Namespace) -> str:
@@ -294,6 +295,7 @@ def _daemon_command(args: argparse.Namespace, model_path: Path | None = None, up
 
 
 def cmd_start(args: argparse.Namespace) -> int:
+    validate_socket_path(_socket(args))
     args.identity = source_identity(Path(args.model), _patterns(args.pattern), tuple(args.exclude or DEFAULT_EXCLUDES))
     with FileLock(_socket(args).with_suffix(".start.lock"), timeout=args.wait_timeout):
         return _start_locked(args)

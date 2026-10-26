@@ -9,6 +9,11 @@ from .runtime import validate_name
 APP_DIR_NAME = "infiniloader"
 
 
+def absolute_path(path: str | os.PathLike[str]) -> Path:
+    """Anchor paths to the caller's directory without following leaf symlinks."""
+    return Path(path).expanduser().absolute()
+
+
 def _writable_dir(path: Path) -> bool:
     try:
         path.mkdir(parents=True, exist_ok=True)
@@ -22,7 +27,7 @@ def _writable_dir(path: Path) -> bool:
 def default_base_dir() -> Path:
     configured = os.environ.get("ILOADER_BASE_DIR")
     if configured:
-        candidate = Path(configured).expanduser()
+        candidate = absolute_path(configured)
         if _writable_dir(candidate):
             return candidate
         raise RuntimeError(f"ILOADER_BASE_DIR is not writable: {candidate}")
@@ -30,46 +35,46 @@ def default_base_dir() -> Path:
     candidates = []
     xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
     if xdg_cache_home:
-        candidates.append(Path(xdg_cache_home).expanduser() / APP_DIR_NAME)
+        candidates.append(absolute_path(xdg_cache_home) / APP_DIR_NAME)
     candidates.append(Path.home() / ".cache" / APP_DIR_NAME)
     for candidate in candidates:
         if _writable_dir(candidate):
             return candidate
-    fallback = Path(os.environ.get("TMPDIR", "/tmp")) / f"{APP_DIR_NAME}-{os.getuid()}"
+    fallback = absolute_path(os.environ.get("TMPDIR", "/tmp")) / f"{APP_DIR_NAME}-{os.getuid()}"
     fallback.mkdir(parents=True, exist_ok=True, mode=0o700)
     return fallback
 
 
 def runtime_dir(base_dir: str | os.PathLike[str] | None = None) -> Path:
-    base = Path(base_dir).expanduser() if base_dir else default_base_dir()
+    base = absolute_path(base_dir) if base_dir else default_base_dir()
     path = base / "run"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def view_root(base_dir: str | os.PathLike[str] | None = None) -> Path:
-    base = Path(base_dir).expanduser() if base_dir else default_base_dir()
+    base = absolute_path(base_dir) if base_dir else default_base_dir()
     path = base / "views"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def dist_view_root(base_dir: str | os.PathLike[str] | None = None) -> Path:
-    base = Path(base_dir).expanduser() if base_dir else default_base_dir()
+    base = absolute_path(base_dir) if base_dir else default_base_dir()
     path = base / "dist-views"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def logs_dir(base_dir: str | os.PathLike[str] | None = None) -> Path:
-    base = Path(base_dir).expanduser() if base_dir else default_base_dir()
+    base = absolute_path(base_dir) if base_dir else default_base_dir()
     path = base / "logs"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def model_cache_root(base_dir: str | os.PathLike[str] | None = None) -> Path:
-    base = Path(base_dir).expanduser() if base_dir else default_base_dir()
+    base = absolute_path(base_dir) if base_dir else default_base_dir()
     path = base / "model-cache"
     path.mkdir(parents=True, exist_ok=True)
     return path

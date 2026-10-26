@@ -17,6 +17,12 @@ def validate_name(name: str) -> str:
     return name
 
 
+def validate_socket_path(path: Path) -> None:
+    encoded = os.fsencode(path)
+    if b"\0" in encoded or len(encoded) > 107:
+        raise ValueError("Unix socket path must fit in 107 bytes; use a shorter --base-dir or --socket")
+
+
 def read_json(path: Path) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
