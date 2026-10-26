@@ -10,6 +10,10 @@ class LoaderConnectionError(RuntimeError):
     pass
 
 
+class LoaderStoppingError(RuntimeError):
+    pass
+
+
 def request(socket_path: str | Path, payload: dict[str, Any], timeout: float = 5.0) -> dict[str, Any]:
     sock_path = str(socket_path)
     try:
@@ -39,5 +43,7 @@ def request(socket_path: str | Path, payload: dict[str, Any], timeout: float = 5
     except ValueError as exc:
         raise LoaderConnectionError(f"invalid response from {sock_path}: {exc}") from exc
     if not response.get("ok", False):
+        if response.get("code") == "stopping":
+            raise LoaderStoppingError(response.get("error", "daemon is stopping"))
         raise RuntimeError(response.get("error", "InfiniLoader daemon request failed"))
     return response

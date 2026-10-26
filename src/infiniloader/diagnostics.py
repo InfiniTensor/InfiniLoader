@@ -35,6 +35,8 @@ def diagnose(base_dir: Path | None = None) -> dict:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.bind(str(root / "probe.sock"))
                 record("unix_socket", True, "socket paths under base directory are usable")
+                os.link(root / "probe.sock", root / "published.sock")
+                record("socket_publication", True, "exclusive socket hard-link publication works")
             fd = os.memfd_create("iloader-doctor", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
             try:
                 import fcntl

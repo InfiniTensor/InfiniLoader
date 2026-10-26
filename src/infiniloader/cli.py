@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import shutil
 import subprocess
 import sys
@@ -18,7 +17,7 @@ from .runtime import FileLock, process_matches, process_token, read_json, signal
 from .memory import parse_bytes
 from .daemon import WeightLoaderDaemon
 from .distributed import build_tp_plan, create_rank_views, simulate_distributed_read
-from .ipc import LoaderConnectionError, request
+from .ipc import LoaderConnectionError, LoaderStoppingError, request
 from .local_cache import cache_status, list_model_caches, materialize_model_cache, verify_cache, garbage_collect, lease_path, touch_cache
 from .paths import (
     absolute_path,
@@ -115,10 +114,7 @@ def _starting_status(args: argparse.Namespace, error: Exception) -> dict | None:
 
 
 def _load_state(path: Path) -> dict | None:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    return read_json(path)
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -318,17 +314,32 @@ def _require_identity(args: argparse.Namespace, status: dict) -> None:
 
 def _start_locked(args: argparse.Namespace) -> int:
     sock = _socket(args)
-    try:
-        status = request(sock, {"command": "status"}, timeout=1.0)["status"]
-    except LoaderConnectionError:
-        status = None
-    if status is not None:
-        _require_identity(args, status)
-        request(sock, {"command": "touch"})
-        print(status["view"])
-        print(f"already running: name={args.name} pid={status['pid']}", file=sys.stderr)
-        return 0
-    starting = _starting_status(args, LoaderConnectionError("not ready"))
+    deadline = time.monotonic() + args.wait_timeout
+    while True:
+        try:
+            status = request(sock, {"command": "status"}, timeout=1.0)["status"]
+        except LoaderConnectionError:
+            status = None
+        starting = _starting_status(args, LoaderConnectionError("not ready")) if status is None else None
+        current = status or starting
+        if current and current.get("state") == "stopping":
+            if time.monotonic() >= deadline:
+                raise TimeoutError("previous daemon is still stopping; retry after it exits")
+            time.sleep(.05)
+            continue
+        if status is not None:
+            _require_identity(args, status)
+            try:
+                request(sock, {"command": "touch"})
+            except (LoaderConnectionError, LoaderStoppingError) as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("daemon stopped while opening the cache; retry") from exc
+                time.sleep(.05)
+                continue
+            print(status["view"])
+            print(f"already running: name={args.name} pid={status['pid']}", file=sys.stderr)
+            return 0
+        break
     proc = None
     if starting:
         _require_identity(args, starting)
@@ -336,6 +347,8 @@ def _start_locked(args: argparse.Namespace) -> int:
             print(starting["view"])
             return 0
     else:
+        with FileLock(sock.with_suffix(".owner.lock"), timeout=max(0, deadline - time.monotonic())):
+            pass  # A stopping owner can still be finishing cleanup after removing its metadata.
         source, upstream_source, local_cache_path = _prepare_model_source(args)
         if source_identity(Path(args.model), _patterns(args.pattern), tuple(args.exclude or DEFAULT_EXCLUDES)) != args.identity:
             raise RuntimeError("source model changed while preparing local cache; retry")
@@ -349,7 +362,6 @@ def _start_locked(args: argparse.Namespace) -> int:
             )
         print(f"starting name={args.name} pid={proc.pid} log={log_path}", file=sys.stderr)
 
-    deadline = time.monotonic() + args.wait_timeout
     last_progress = None
     while time.monotonic() < deadline:
         if proc is not None and proc.poll() is not None:
@@ -443,7 +455,7 @@ def _status_for_name(name: str, args: argparse.Namespace) -> dict:
     )
     try:
         status = request(_socket(ns), {"command": "status"}, timeout=ns.timeout)["status"]
-        status["state"] = "ready"
+        status.setdefault("state", "ready")
         return status
     except LoaderConnectionError as exc:
         starting = _starting_status(ns, exc)
@@ -494,27 +506,36 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _wait_for_exit(pid: int, token: str, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while process_matches(pid, token):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("daemon is still stopping; view was preserved, retry after it exits")
+        time.sleep(.05)
+
+
 def _stop_one(args: argparse.Namespace) -> int:
     _resolve_name(args)
     try:
         response = request(_socket(args), {"command": "stop", "remove_view": args.remove_view,
                                           "force": getattr(args, "force", False)}, timeout=args.timeout)
-        print(f"{args.name}: {'stopping' if response.get('stopping') else 'ok'}")
+        pid, token = response.get("pid"), response.get("process_token")
+        if pid is not None and token is not None:
+            _wait_for_exit(int(pid), token, args.timeout)
+            print(f"{args.name}: stopped")
+        else:
+            print(f"{args.name}: {'stopping' if response.get('stopping') else 'ok'}")
         return 0
     except LoaderConnectionError as exc:
         starting = _starting_status(args, exc)
         if not starting:
             print(f"{args.name}: {exc}", file=sys.stderr)
             return 1
-        if starting.get("state") not in ("starting", "loading") and not getattr(args, "force", False):
+        if starting.get("state") not in ("starting", "loading", "loaded") and not getattr(args, "force", False):
             raise RuntimeError("ready daemon is unresponsive; no signal was sent, retry or use stop --force")
         signal_owned_process(int(starting["pid"]), starting.get("process_token"))
+        _wait_for_exit(int(starting["pid"]), starting.get("process_token"), args.timeout)
         if args.remove_view:
-            deadline = time.monotonic() + args.timeout
-            while process_matches(int(starting["pid"]), starting.get("process_token")):
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("daemon has not exited; view was preserved")
-                time.sleep(.05)
             view = Path(starting["view"])
             if view.exists():
                 _safe_remove_view(view, expected_pid=int(starting["pid"]))

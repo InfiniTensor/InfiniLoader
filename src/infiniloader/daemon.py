@@ -11,6 +11,7 @@ import struct
 import threading
 import uuid
 import stat
+import errno
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from .runtime import FileLock, atomic_json, atomic_text, process_token, process_
 from .local_cache import lease_path, verify_cache
 from .memory import ResidentReservation
 from .paths import absolute_path
+from .ipc import LoaderStoppingError
 
 
 class WeightLoaderDaemon:
@@ -84,6 +86,7 @@ class WeightLoaderDaemon:
         self._connections = threading.BoundedSemaphore(16)
         self._claimed_runtime: dict[Path, tuple[int, int]] = {}
         self._socket_identity: dict | None = None
+        self._private_socket: Path | None = None
 
     def log(self, message: str) -> None:
         if not self.quiet:
@@ -102,6 +105,7 @@ class WeightLoaderDaemon:
         state.setdefault("idle_ttl", self.idle_ttl)
         state.setdefault("memory_budget", self._reservation.info if self._reservation else None)
         state.setdefault("runtime_socket", self._socket_identity)
+        state.setdefault("runtime_private_socket", str(self._private_socket) if self._private_socket else None)
         atomic_json(self.state_path, state)
         self._claim_runtime_file(self.state_path)
 
@@ -150,7 +154,7 @@ class WeightLoaderDaemon:
         load_seconds = self.load_finished_at - self.load_started_at
         self._write_state(
             {
-                "state": "ready",
+                "state": "loaded",
                 "load_started_at": self.load_started_at,
                 "load_finished_at": self.load_finished_at,
                 "load_seconds": load_seconds,
@@ -169,6 +173,7 @@ class WeightLoaderDaemon:
     def _status(self) -> dict[str, Any]:
         assert self.cached is not None
         return {
+            "state": "stopping" if self._stop else "ready",
             "name": self.name,
             "identity": self.identity,
             "process_token": self.process_token,
@@ -211,7 +216,7 @@ class WeightLoaderDaemon:
     def _handle_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
         command = payload.get("command")
         if self._stop and command not in ("ping", "status", "lease-release"):
-            raise RuntimeError("daemon is stopping; retry after it exits")
+            raise LoaderStoppingError("daemon is stopping; retry after it exits")
         if command == "ping":
             return {"ok": True, "pong": True}
         if command == "status":
@@ -247,7 +252,8 @@ class WeightLoaderDaemon:
                 raise RuntimeError("cache was used after collection was planned")
             self._remove_view_on_exit = bool(payload.get("remove_view", False))
             self._stop = True
-            return {"ok": True, "stopping": True}
+            self._write_state({"state": "stopping", **self._status()})
+            return {"ok": True, "stopping": True, "pid": os.getpid(), "process_token": self.process_token}
         return {"ok": False, "error": f"unknown command: {command!r}"}
 
     def _serve_connection(self, conn: socket.socket) -> None:
@@ -278,6 +284,8 @@ class WeightLoaderDaemon:
                     response = self._handle(payload)
                 except (ValueError, TypeError, RuntimeError) as exc:
                     response = {"ok": False, "error": str(exc)}
+                    if isinstance(exc, LoaderStoppingError):
+                        response["code"] = "stopping"
                 conn.settimeout(1.0)
                 conn.sendall(json.dumps(response).encode("utf-8") + b"\n")
         except OSError:
@@ -301,6 +309,8 @@ class WeightLoaderDaemon:
         self._claimed_runtime[path] = (st.st_dev, st.st_ino)
 
     def _check_runtime_paths(self) -> None:
+        stale_pid = None
+        stale_socket = None
         paths = (self.socket_path, self.pid_path, self.state_path)
         if len({path.resolve() for path in paths}) != len(paths):
             raise RuntimeError("socket, PID and state paths must be distinct")
@@ -326,6 +336,7 @@ class WeightLoaderDaemon:
             if process_matches(state["pid"], state.get("process_token")):
                 raise RuntimeError("runtime metadata belongs to a live daemon")
         if self.pid_path.exists():
+            stale_pid = self.pid_path.lstat()
             try:
                 pid = int(self.pid_path.read_text().strip())
             except (OSError, ValueError) as exc:
@@ -346,6 +357,69 @@ class WeightLoaderDaemon:
                     raise RuntimeError(f"cannot establish that runtime socket is stale: {self.socket_path}") from exc
                 else:
                     raise RuntimeError(f"runtime socket still has a listener: {self.socket_path}")
+            stale_socket = st
+        # Validate every public resource before removing any stale one. Removing
+        # the old PID first avoids publishing a new state next to an old PID.
+        if state:
+            private = state.get("runtime_private_socket")
+            if isinstance(private, str):
+                path = absolute_path(private)
+                if path.parent == self.socket_path.parent and path not in paths:
+                    try:
+                        st = path.lstat()
+                        expected = {"device": st.st_dev, "inode": st.st_ino}
+                        if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid() and expected == state.get("runtime_socket"):
+                            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                                probe.settimeout(.2)
+                                try:
+                                    probe.connect(str(path))
+                                except ConnectionRefusedError:
+                                    self._remove_stale_file(path, st)
+                    except OSError:
+                        pass  # Preserve anything whose ownership/liveness is uncertain.
+        if stale_pid is not None:
+            self._remove_stale_file(self.pid_path, stale_pid)
+        if stale_socket is not None:
+            self._remove_stale_file(self.socket_path, stale_socket)
+
+    @staticmethod
+    def _remove_stale_file(path: Path, expected: os.stat_result) -> None:
+        current = path.lstat()
+        if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+            raise RuntimeError(f"runtime resource changed during startup: {path}")
+        path.unlink()
+
+    def _publish_socket(self, server: socket.socket) -> None:
+        # Keep private names no longer than the preflighted public basename.
+        width = min(12, len(os.fsencode(self.socket_path.name)))
+        for _ in range(64):
+            name = uuid.uuid4().hex[:width]
+            if width > 1:
+                name = "." + name[1:]
+            private = self.socket_path.with_name(name)
+            if private in (self.socket_path, self.pid_path, self.state_path):
+                continue
+            try:
+                server.bind(str(private))
+            except OSError as exc:
+                if exc.errno == errno.EADDRINUSE:
+                    continue
+                raise
+            break
+        else:
+            raise RuntimeError("cannot reserve a private runtime socket")
+        self._private_socket = private
+        self._claim_runtime_file(private)
+        st = private.lstat()
+        self._socket_identity = {"device": st.st_dev, "inode": st.st_ino}
+        os.chmod(private, 0o600)
+        server.listen(16)
+        # Persist the inode before making the socket visible. A crash can then
+        # leave either no public socket or one that can be verified on restart.
+        self._write_state({"state": "loaded"})
+        self._claimed_runtime[self.socket_path] = (st.st_dev, st.st_ino)
+        os.link(private, self.socket_path, follow_symlinks=False)
+        private.unlink()
 
     def _install_signal_handlers(self) -> None:
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -392,8 +466,6 @@ class WeightLoaderDaemon:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         self.pid_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        if self.socket_path.exists():
-            self.socket_path.unlink()
         self._write_state({"state": "starting"})
         atomic_text(self.pid_path, str(os.getpid()))
         self._claim_runtime_file(self.pid_path)
@@ -410,12 +482,7 @@ class WeightLoaderDaemon:
 
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             server.settimeout(1.0)
-            server.bind(str(self.socket_path))
-            self._claim_runtime_file(self.socket_path)
-            st = self.socket_path.lstat()
-            self._socket_identity = {"device": st.st_dev, "inode": st.st_ino}
-            os.chmod(self.socket_path, 0o600)
-            server.listen(16)
+            self._publish_socket(server)
             self._write_state({"state": "ready", "progress": 1.0,
                                "copied_bytes": self.cached.total_bytes, **self._status()})
             self.log(f"[listen] socket={self.socket_path}")
