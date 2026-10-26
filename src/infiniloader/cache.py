@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 from .runtime import read_json
+from .memory import memory_info, check_memory
 
 
 DEFAULT_EXCLUDES = (
@@ -118,14 +119,7 @@ def human_bytes(value: int) -> str:
 
 
 def available_memory_bytes() -> int | None:
-    meminfo = Path("/proc/meminfo")
-    try:
-        for line in meminfo.read_text(encoding="utf-8").splitlines():
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) * 1024
-    except OSError:
-        return None
-    return None
+    return memory_info()["available_bytes"]
 
 
 def _matches_any(rel: str, patterns: Iterable[str]) -> bool:
@@ -312,6 +306,8 @@ def load_model_into_memory(
     progress: ProgressFn | None = None,
     chunk_size: int = 64 * 1024 * 1024,
     workers: int = 1,
+    max_memory_bytes: int | None = None,
+    reserve_bytes: int = 256 * 1024 * 1024,
 ) -> CachedModel:
     if chunk_size <= 0 or workers < 1 or not 0 < max_memory_fraction <= 1:
         raise ValueError("chunk_size and workers must be positive; memory fraction must be in (0, 1]")
@@ -323,13 +319,9 @@ def load_model_into_memory(
     if progress:
         progress(0, total, Path("."))
 
-    available = available_memory_bytes()
-    if available is not None and total > int(available * max_memory_fraction) and not force:
-        raise MemoryError(
-            "selected model is larger than the memory budget: "
-            f"{human_bytes(total)} selected, {human_bytes(available)} available, "
-            f"budget fraction {max_memory_fraction:.2f}; rerun with --force to bypass"
-        )
+    buffers = min(workers, len(source_files)) * min(chunk_size, max(f.size for f in source_files))
+    check_memory(total + buffers, fraction=max_memory_fraction, max_bytes=max_memory_bytes,
+                 reserve_bytes=reserve_bytes, force=force)
 
     copied = 0
     cached_by_index: list[CachedFile | None] = [None] * len(source_files)

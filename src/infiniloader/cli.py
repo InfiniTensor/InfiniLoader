@@ -15,6 +15,7 @@ from . import __version__
 from .benchmark import benchmark_path
 from .cache import DEFAULT_EXCLUDES, build_view, human_bytes, inspect_source, load_model_into_memory, source_identity, _safe_remove_view
 from .runtime import FileLock, process_matches, read_json, signal_owned_process, validate_name
+from .memory import parse_bytes
 from .daemon import WeightLoaderDaemon
 from .distributed import build_tp_plan, create_rank_views, simulate_distributed_read
 from .ipc import LoaderConnectionError, request
@@ -238,6 +239,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         workers=args.workers,
         quiet=args.quiet,
         identity=json.loads(args.identity) if getattr(args, "identity", None) else None,
+        max_memory_bytes=args.max_memory_bytes,
+        reserve_bytes=args.reserve_bytes,
+        max_resident_bytes=args.max_resident_bytes,
     )
     return daemon.serve_forever()
 
@@ -279,6 +283,10 @@ def _daemon_command(args: argparse.Namespace, model_path: Path | None = None, up
     if args.force:
         command.append("--force")
     command.extend(["--identity", json.dumps(args.identity, sort_keys=True)])
+    command.extend(["--reserve-bytes", str(args.reserve_bytes)])
+    for option in ("max_memory_bytes", "max_resident_bytes"):
+        if getattr(args, option, None) is not None:
+            command.extend(["--" + option.replace("_", "-"), str(getattr(args, option))])
     return command
 
 
@@ -295,6 +303,10 @@ def _require_identity(args: argparse.Namespace, status: dict) -> None:
         raise RuntimeError("name already belongs to a different view path")
     if args.refresh_cache:
         raise RuntimeError("stop the running cache before requesting --refresh-cache")
+    for option in ("max_memory_bytes", "max_resident_bytes"):
+        requested = getattr(args, option, None)
+        if requested is not None and (status.get("memory_budget") or {}).get(option) != requested:
+            raise RuntimeError(f"stop the running cache before changing --{option.replace('_', '-')}")
 
 
 def _start_locked(args: argparse.Namespace) -> int:
@@ -900,6 +912,11 @@ def build_parser() -> argparse.ArgumentParser:
     start_p.add_argument("--refresh-cache", action="store_true")
     start_p.add_argument("--cache-workers", type=int, default=4)
     start_p.set_defaults(func=cmd_start)
+
+    for memory_parser in (serve_p, start_p):
+        memory_parser.add_argument("--max-memory-bytes", type=parse_bytes, help="per-cache preload cap including worker buffers")
+        memory_parser.add_argument("--reserve-bytes", type=parse_bytes, default=256 * 1024 * 1024, help="headroom left for the engine; default 256 MiB")
+        memory_parser.add_argument("--max-resident-bytes", type=parse_bytes, help="set persistent total resident quota for this base directory")
 
     cache_p = sub.add_parser("cache", help="materialize a local model cache")
     cache_p.add_argument("model")
