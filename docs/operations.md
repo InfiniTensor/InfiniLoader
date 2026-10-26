@@ -1,8 +1,8 @@
-# Operating the development version
+# Operating the cache service
 
-This branch improves reliability and local usability. TP checkpoint conversion and
-multi-node transport remain future work. Runtime dependencies remain limited to
-Python's standard library. Linux and Python 3.10+ are required.
+This page covers the core file-cache service. Runtime dependencies are limited to
+Python's standard library; Linux and Python 3.10+ are required. Explicit tensor
+sharding and CPU/GPU integration are [optional experimental APIs](distributed.md).
 
 ## Choose a backend
 
@@ -33,6 +33,10 @@ weight transformation and CPU-to-device transfers remain the engine's responsibi
 
 ## Identity, verification and migration
 
+Stop existing daemons before replacing the InfiniLoader package or checkout. The
+CLI and daemon are expected to use the same revision. Engine restarts can reuse
+the cache without upgrading or restarting InfiniLoader itself.
+
 A resident name identifies one source path, file selection and source fingerprint.
 The fingerprint includes sizes, nanosecond timestamps, device and inode IDs. Reusing
 a name for another revision fails; stop the cache or choose another name. Changes
@@ -48,6 +52,9 @@ not authenticate a publisher or validate model semantics.
 NEW_LOCAL=$(iloader cache "$MODEL" --name dev --refresh)
 iloader verify "$NEW_LOCAL" --json
 ```
+
+The disk-cache root must be outside the source model directory, including through
+symlink aliases. Overlapping roots are rejected before copying.
 
 Refresh publishes a new generation, preserves old paths, and needs additional disk
 space. SHA-256 is computed during the copy and its CPU cost belongs in preparation
@@ -74,9 +81,16 @@ iloader start "$MODEL" --name dev --workers 4 \
   caps remain enforced. Quotas account for InfiniLoader, not engine allocations.
 - Byte options accept integers and binary suffixes such as `256MiB` and `32GiB`.
 
-Use a node-local `--base-dir`. A runtime registry shared between nodes is unsupported.
+Use a node-local `--base-dir` supporting locks, Unix sockets and hard links.
+Relative paths are anchored at startup. The encoded socket path must fit in 107
+bytes; use a shorter `--base-dir` or explicit `--socket` when needed. A runtime
+registry shared between nodes is unsupported.
 
 ## Leases, LRU and TTL
+
+`stop` waits for the original daemon PID/token to exit and returns an error if its
+timeout is exceeded. Raw IPC stop requests are asynchronous. A subsequent `start`
+waits for a stopping instance within its readiness timeout.
 
 `run` protects a cache against ordinary stop and eviction. Local-cache daemons also
 hold a disk-generation lease. Foreground disk commands inherit its OS lock descriptor;
@@ -115,7 +129,8 @@ iloader list --json
 iloader dist-simulate "$VIEW" --ranks 4 --timeout 60
 ```
 
-Doctor exercises locks, Unix sockets, memfd sealing and reopening in another process.
+Doctor exercises locks, Unix sockets, exclusive socket hard-link publication,
+memfd sealing and reopening in another process.
 It reports cgroup headroom, disk space, FD and memlock limits. Status includes identity,
 file bytes, the startup budget snapshot, active leases, reuse requests and last use.
 Distributed simulation is a bounded single-host read test, not a GPU benchmark.
@@ -126,7 +141,11 @@ and pass proc and user-namespace access checks. A shared volume alone is insuffi
 Test an actual engine open in the deployment environment. Resolving individual view
 file symlinks to their final target can break reopening; use the published file paths.
 After a daemon exits, existing open descriptors/mappings may survive, but new opens
-through its view fail. Automatic failover is not provided.
+through its view fail. Automatic failover is not provided. New socket publication records its inode
+before exposing the public path, allowing verified stale state to be reclaimed
+after an interrupted startup. Unknown files, symlinks, listeners or sockets
+without matching ownership are still refused. Preserve and inspect such paths
+before manual recovery; do not indiscriminately delete a runtime directory.
 
 The non-root diagnostic image contains InfiniLoader, without an engine or model:
 
@@ -137,6 +156,7 @@ docker run --rm --memory=2g infiniloader:dev
 
 ## Validation
 
+See [contributing](../CONTRIBUTING.md) for core and optional test dependencies.
 Run `python -m pytest`, `iloader selftest`, and `iloader doctor`. CI tests Python
 3.10-3.14 on Ubuntu. Tests exercise real daemon subprocesses, source mutations,
 disconnected clients, immutable generations, quotas, leases, and failed ranks.
@@ -144,6 +164,7 @@ disconnected clients, immutable generations, quotas, leases, and failed ranks.
 `bench` reports each run, first-run and median time, and best throughput. It does not
 clear OS page cache. Compare cold/warm shared storage, cold/warm local disk, memfd and
 engine-native loaders separately. Include preparation, end-to-end engine readiness,
-peak CPU memory, per-rank bytes and CPU-to-device transfers. Historical README numbers
-are not new measurements for this branch; CPU tests do not establish GPU or multi-node
-performance.
+peak CPU memory, per-rank bytes and CPU-to-device transfers. The
+[archived engine measurements](archive/original-engine-measurements.md) are
+historical observations, not measurements for the current branch; CPU tests do
+not establish GPU or multi-node performance.

@@ -2,7 +2,7 @@
 
 > Historical 2026-10-18 measurements retain their original tested commit IDs.
 > The reorganized history preserves production code and examples byte-for-byte;
-> see [history-reorganization.md](history-reorganization.md) for provenance
+> see [history-reorganization.md](2026-10-26-history-reorganization.md) for provenance
 > and independently repeated CPU tests. No new four-node/device run is claimed.
 
 Date: 2026-10-18, Asia/Shanghai. Feature branch: `codex/distributed-residency`, based
@@ -17,8 +17,8 @@ on reviewed reliability commit `7442271`. No merge into master was performed.
 | CPU weights plus GPU hot/CPU cold experts | Grouped, bounded GPU copies; stream-aware leases and LRU; real CPU/GPU ReLU MoE, repeated hot-set changes and failure injection on four DCUs | Sequential reference expert execution; no CPU/GPU overlap claim, distributed EP/MoE, quantized kernel or native KTransformers adapter. |
 
 The detailed protocol, commands, contracts and source references are in
-[distributed.md](distributed.md). Sanitized numerical evidence is provided in
-[distributed-results.json](distributed-results.json).
+[distributed.md](../distributed.md). Sanitized numerical evidence is provided in
+[distributed-results.json](2026-10-18-distributed-results.json).
 
 ## Environments and methodology
 

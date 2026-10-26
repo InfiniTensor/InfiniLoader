@@ -29,7 +29,7 @@ Python 3.14.4、PyTorch 2.14.1+cpu、NumPy 2.5.4、safetensors 0.8.0、pytest 9.
 | 11 | 本文件所在提交 | Document validated history and development priorities | 文档与来源映射；最终 hash 的审核结果随交付报告给出 |
 
 逐提交元数据、原始 pytest 日志 SHA-256 及完整映射见
-[history-reorganization.json](history-reorganization.json)。原始日志保存在本次任务的
+[history-reorganization.json](2026-10-26-history-reorganization.json)。原始日志保存在本次任务的
 `InfiniLoader-commit-review-20261026` 证据目录；该本地目录不是公开下载链接。
 
 生命周期专家审核了 1–5；缓存/内存专家审核了 1、3、4、7、8、10；CLI/验证专家审核
@@ -60,7 +60,7 @@ git diff 88d6bac improve-weight-residency -- tests
 
 原四机 CPU/GPU 测量保留其真实代码版本（例如 `123c6e2`、`758f8c8`），不改写为新 hash。
 源码相同说明实现被保留，不代表本次重新执行了 GPU、RCCL 或四机实验。两个真实设备
-测试在本地 CPU 环境跳过，原设备验证见 [distributed-validation.md](distributed-validation.md)。
+测试在本地 CPU 环境跳过，原设备验证见 [distributed-validation.md](2026-10-18-distributed-validation.md)。
 当前分支的远端 CI 应查看该分支自己的 Actions；原报告中的旧 Actions 链接仍只证明旧提交。
 
 ## 原提交归属
@@ -87,4 +87,4 @@ git diff 88d6bac improve-weight-residency -- tests
 | `758f8c8` | 9 | Startup barrier included in initial TP/PP harness |
 | `88d6bac` | 11 | Distributed contracts, historical numerical evidence and README |
 
-后续能力优先级与验收条件见 [roadmap.zh-CN.md](roadmap.zh-CN.md)。
+后续能力优先级与验收条件见 [roadmap.zh-CN.md](2026-10-26-roadmap.zh-CN.md)。

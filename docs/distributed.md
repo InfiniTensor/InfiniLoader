@@ -1,5 +1,9 @@
 # Distributed CPU residency and hybrid expert integration
 
+These APIs and examples are experimental and optional. The core file-cache path
+does not require PyTorch. The archived device/multi-node measurements identify
+the exact historical versions; they do not establish production engine compatibility.
+
 InfiniLoader now provides explicit safetensors partitioning, a PyTorch CPU tensor
 store, and a bounded GPU expert pool. The reference examples execute real TP/PP
 and a dense ReLU MoE. Framework-specific Llama/GQA, quantized kernels and
@@ -30,7 +34,8 @@ that these engines consume the new InfiniLoader shard format directly.
 
 ## Explicit checkpoint preparation
 
-The legacy `dist-plan` remains a heuristic report. The new executable path requires
+The legacy `dist-plan` remains a heuristic report. It shares strict format and
+index validation with `shard`, while reading headers rather than hashing payloads. The new executable path requires
 an exact tensor inventory and explicit TP dimension/PP stage for **every** tensor:
 
 ```json
@@ -198,5 +203,5 @@ verify host/checkpoint identity, allocate devices, bound execution and collect a
 rank results. The example is a validation harness, not a fault-tolerant cluster
 controller, authenticated tensor-transfer service or inference serving framework.
 
-See [distributed validation](distributed-validation.md) for the tested hardware,
+See [distributed validation](archive/2026-10-18-distributed-validation.md) for the tested hardware,
 results, independent review and remaining limitations.

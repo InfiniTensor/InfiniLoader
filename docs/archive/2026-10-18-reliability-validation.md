@@ -38,7 +38,7 @@ TTL while a lease is active, then verifies eviction after lease release.
 The original branch HEAD `6a33d83` passed the complete remote Ubuntu Python 3.10-3.14
 matrix in [Actions run 39101870656](https://github.com/InfiniTensor/InfiniLoader/actions/runs/39101870656).
 Check the newer branch workflow for the subsequent review fixes. Independent review
-and per-commit test details are recorded in [expert-review.md](expert-review.md).
+and per-commit test details are recorded in [expert-review.md](2026-10-18-expert-review.md).
 The Dockerfile is a non-root diagnostic image; Docker was unavailable locally, so
 the image was not built or exercised in this environment.
 
