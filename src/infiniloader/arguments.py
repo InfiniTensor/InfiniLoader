@@ -68,7 +68,8 @@ def build_parser(handlers: Mapping[str, CommandHandler]) -> argparse.ArgumentPar
     start_p.add_argument("--exclude", action="append")
     start_p.add_argument("--force", action="store_true")
     start_p.add_argument("--no-wait", action="store_true")
-    start_p.add_argument("--wait-timeout", type=float, default=600.0)
+    start_p.add_argument("--wait-timeout", type=float, default=600.0,
+                         help="daemon readiness/registration wait in seconds; local cache preparation is excluded")
     start_p.add_argument("--chunk-size", type=int, default=64 * 1024 * 1024)
     start_p.add_argument("--workers", type=int, default=1, help="parallel memfd preload workers")
     start_p.add_argument("--max-memory-fraction", type=float, default=0.90)

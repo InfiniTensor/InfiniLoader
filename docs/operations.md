@@ -104,6 +104,13 @@ Relative paths are anchored at startup. The encoded socket path must fit in 107
 bytes; use a shorter `--base-dir` or explicit `--socket` when needed. A runtime
 registry shared between nodes is unsupported.
 
+`start --wait-timeout SECONDS` bounds runtime waits, not local disk-cache
+preparation. A newly spawned daemon gets a fresh interval for readiness, or for
+PID/state registration with `--no-wait`. Lock acquisition and waiting for an
+existing instance still use bounded waits. Preparation failures return before a
+daemon is spawned; a subsequent readiness timeout can leave the daemon loading,
+so inspect `status` and the log before retrying.
+
 ## Leases, LRU and TTL
 
 `stop` waits for the original daemon PID/token to exit and returns an error if its

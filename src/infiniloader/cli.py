@@ -361,6 +361,7 @@ def _start_locked(args: argparse.Namespace) -> int:
                 stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                 start_new_session=True, close_fds=True,
             )
+        deadline = time.monotonic() + args.wait_timeout
         print(f"starting name={args.name} pid={proc.pid} log={log_path}", file=sys.stderr)
 
     last_progress = None
