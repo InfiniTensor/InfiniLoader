@@ -2,6 +2,23 @@
 
 [English README](README.md)
 
+开发分支新增了模型身份校验、daemon 启动互斥、memfd 写封印、不可变磁盘缓存版本、
+容器内存预算及租约保护。新增 `doctor`、`verify`、`run`、`gc` 命令，详见
+[运行管理与迁移说明](docs/operations.md)。
+
+```bash
+iloader doctor
+iloader start "$MODEL" --name dev --local-cache \
+  --max-memory-bytes 32GiB --reserve-bytes 4GiB --max-resident-bytes 64GiB
+iloader run dev -- vllm serve '{model}'
+iloader gc --resident --max-bytes 32GiB       # 只预览
+iloader gc --resident --max-bytes 32GiB --apply
+```
+
+内存紧张时，可只用 `iloader cache` 构建本地磁盘缓存，再用
+`iloader run --cache-path PATH -- COMMAND` 启动框架。原有直接传 view 路径的方式仍可使用；
+自动清理无法识别未注册的读者，启用闲置过期或执行清理前应通过 `run` 保护任务。
+
 `InfiniLoader` 是一个面向大模型推理框架开发调试的用户态权重加载管理器。它解决的核心问题是：调试 vLLM、SGLang、InfiniLM 或自研推理框架时，经常需要反复停止、修改代码、重新启动框架，而每次启动都要重新从存储读取模型权重。
 
 默认模式下，InfiniLoader 会把模型目录常驻在内存里，并暴露出一个看起来像普通 Hugging Face 模型目录的路径。框架仍然使用原来的文件读取逻辑，通常只需要把模型路径换成 `iloader start/view` 输出的路径。
