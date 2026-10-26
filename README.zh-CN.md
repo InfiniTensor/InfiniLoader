@@ -258,4 +258,9 @@ iloader selftest
 - 框架读取 view 时，InfiniLoader daemon 必须保持运行。
 - 默认 view 会在内存中保留一份选中的模型文件内容。
 - 0.1.0 不包含完全透明的同路径拦截；需要把输出的 view 路径传给推理引擎。
-- 当前清理版不包含物理 rank-sharded checkpoint 转换；`dist-plan` 只做候选 tensor 切分分析。
+- `shard plan/export/verify` 已支持显式 TP/PP checkpoint；`dist-plan` 仍仅做候选分析。生产引擎加载这些分片需要适配器。
+
+## 开发说明
+
+显式分片、CPU TensorStore 与专家池接口见 [分布式与混合驻留](docs/distributed.md)。
+提交线及验证见 [提交重整记录](docs/history-reorganization.md)，后续能力见 [开发路线](docs/roadmap.zh-CN.md)。

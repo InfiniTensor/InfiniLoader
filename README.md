@@ -240,6 +240,9 @@ iloader dist-plan "$MODEL" --tp 4 --limit 20
 
 ## Command Summary
 
+Explicit tensor sharding, live CPU layout selection and the CPU/GPU expert API
+are documented in [Distributed and hybrid residency](docs/distributed.md).
+
 ```bash
 iloader inspect MODEL_DIR
 iloader start MODEL_DIR --name NAME
@@ -296,5 +299,11 @@ local cache plus memfd views.
 - The default view duplicates selected model bytes in RAM.
 - Fully transparent same-path interception is not included in 0.1.0; pass the
   printed view path to the engine.
-- Physical rank-sharded checkpoint conversion is not included in this cleaned
-  release; `dist-plan` only analyzes candidate tensor splits.
+- `shard plan/export/verify` supports explicit InfiniLoader TP/PP checkpoints.
+  `dist-plan` still only analyzes candidates. Loading these checkpoints into a
+  production model engine requires an adapter; see the reference PyTorch MLP.
+
+## Development notes
+
+See [commit history and validation](docs/history-reorganization.md) and the
+[development roadmap](docs/roadmap.zh-CN.md).

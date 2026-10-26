@@ -1,0 +1,363 @@
+{
+  "date": "2026-10-26",
+  "branch": "improve-weight-residency",
+  "base": "5014a6a3459f0af4629097b92bddf9d8c14e97fd",
+  "archived_source_head": "88d6bac6a80a424201da1688989d1d87e3217a93",
+  "implementation_checkpoint": "895c5efce64030dacc635eb26331d1aa606417b2",
+  "author": "whjthu <haojie0429@gmail.com>",
+  "committer": "whjthu <haojie0429@gmail.com>",
+  "implementation_git_objects": {
+    "src": {
+      "original_git_object": "75d6fb1fa850c4869ab2cbd1d9926d5db909e7c2",
+      "reorganized_git_object": "75d6fb1fa850c4869ab2cbd1d9926d5db909e7c2",
+      "equal": true
+    },
+    "tests": {
+      "original_git_object": "e7766d1d8ecdd158659aa6b5e36df6b52b149476",
+      "reorganized_git_object": "f1e98e2fe02aa9ff4af3b1c34d95fd0fa445b0e7",
+      "equal": false,
+      "only_difference": "Corrupt-rank test startup timeout increased from 3 to 20 seconds; all failure/reaping assertions preserved."
+    },
+    "examples": {
+      "original_git_object": "f5317c389c7db9019e9054a9772cbab070d2aaaa",
+      "reorganized_git_object": "f5317c389c7db9019e9054a9772cbab070d2aaaa",
+      "equal": true
+    },
+    ".github": {
+      "original_git_object": "1055429eb9eaecee7c918f3ec13b346992b5c002",
+      "reorganized_git_object": "1055429eb9eaecee7c918f3ec13b346992b5c002",
+      "equal": true
+    },
+    "deploy": {
+      "original_git_object": "4108c1d2d31a0311432a6bbcbaffc67b92cc941b",
+      "reorganized_git_object": "4108c1d2d31a0311432a6bbcbaffc67b92cc941b",
+      "equal": true
+    },
+    "pyproject.toml": {
+      "original_git_object": "6813f8d38b81f6076e28518d5850c3f6c43bfe11",
+      "reorganized_git_object": "6813f8d38b81f6076e28518d5850c3f6c43bfe11",
+      "equal": true
+    }
+  },
+  "independent_per_commit_tests": [
+    {
+      "step": 1,
+      "commit": "ea57e3c0c0e25c4e6fe378569dd949252f01b0b0",
+      "subject": "Protect sealed weight snapshots and daemon runtime ownership",
+      "author_name": "whjthu",
+      "author_email": "haojie0429@gmail.com",
+      "committer_name": "whjthu",
+      "committer_email": "haojie0429@gmail.com",
+      "identity_ok": true,
+      "single_english_subject_ok": true,
+      "exit_code": 0,
+      "elapsed_seconds": 9.4,
+      "log": "01-ea57e3c-pytest.txt",
+      "summary": "40 passed in 7.09s",
+      "raw_pytest_sha256": "b874aa1a71328c3ff5e072077c10885b30852792437568bdf2ff73a5d9fea7ad"
+    },
+    {
+      "step": 2,
+      "commit": "63e7ea42ac5dcef3f8384a455f859510015f704b",
+      "subject": "Bound IPC requests and cancel failed distributed reads",
+      "author_name": "whjthu",
+      "author_email": "haojie0429@gmail.com",
+      "committer_name": "whjthu",
+      "committer_email": "haojie0429@gmail.com",
+      "identity_ok": true,
+      "single_english_subject_ok": true,
+      "exit_code": 0,
+      "elapsed_seconds": 14.57,
+      "log": "02-63e7ea4-pytest.txt",
+      "summary": "46 passed in 11.71s",
+      "raw_pytest_sha256": "6759f5949b4abcff97d8c4fc5e9b7f400a559c66e8298a91dd67f2d09743cf6d"
+    },
+    {
+      "step": 3,
+      "commit": "97335f6f718dc8eea9724bb90908f874ab3cd828",
+      "subject": "Publish verified disk cache generations with lease-aware collection",
+      "author_name": "whjthu",
+      "author_email": "haojie0429@gmail.com",
+      "committer_name": "whjthu",
+      "committer_email": "haojie0429@gmail.com",
+      "identity_ok": true,
+      "single_english_subject_ok": true,
+      "exit_code": 0,
+      "elapsed_seconds": 16.45,
+      "log": "03-97335f6-pytest.txt",
+      "summary": "62 passed in 12.15s",
+      "raw_pytest_sha256": "cb594ab2b711f786748d039fcfbcaf3ce47fd77f019e3d15648893f69e9c8299"
+    },
+    {
+      "step": 4,
+      "commit": "8cca2e6fdc7f5c5d15075ecb20519073502f01eb",
+      "subject": "Enforce container memory limits and shared resident budgets",
+      "author_name": "whjthu",
+      "author_email": "haojie0429@gmail.com",
+      "committer_name": "whjthu",
+      "committer_email": "haojie0429@gmail.com",
+      "identity_ok": true,
+      "single_english_subject_ok": true,
+      "exit_code": 0,
+      "elapsed_seconds": 15.97,
+      "log": "04-8cca2e6-pytest.txt",
+      "summary": "69 passed in 12.73s",
+      "raw_pytest_sha256": "e1d9f33f1dad63eb375860e97c22505c697d400d885fc1345dec0fd8f7ec3570"
+    },
+    {
+      "step": 5,
+      "commit": "e2c20659880966071aded2a41905adbe8f5832d8",
+      "subject": "Add leased commands and cache lifecycle diagnostics",
+      "author_name": "whjthu",
+      "author_email": "haojie0429@gmail.com",
+      "committer_name": "whjthu",
+      "committer_email": "haojie0429@gmail.com",
+      "identity_ok": true,
+      "single_english_subject_ok": true,
+      "exit_code": 0,
+      "elapsed_seconds": 33.62,
+      "log": "05-e2c2065-pytest.txt",
+      "summary": "77 passed in 25.08s",
+      "raw_pytest_sha256": "be4e1d73ed316bcae8d74340ba31710b809114a221b1e2a28bd938c9b38bf551"
+    },
+    {
+      "step": 6,
+      "commit": "7454e9cb73f500ec37dd06ad2df88849b1d2c12f",
+      "subject": "Document cache operations and add Linux regression CI",
+      "author_name": "whjthu",
+      "author_email": "haojie0429@gmail.com",
+      "committer_name": "whjthu",
+      "committer_email": "haojie0429@gmail.com",
+      "identity_ok": true,
+      "single_english_subject_ok": true,
+      "exit_code": 0,
+      "elapsed_seconds": 28.95,
+      "log": "06-7454e9c-pytest.txt",
+      "summary": "77 passed in 23.76s",
+      "raw_pytest_sha256": "fa9f44d93921cba94a2aecc120ef11fb5813ac2ed3b5a4b4fda4371738063f15"
+    },
+    {
+      "step": 7,
+      "commit": "48615de1981afb1ff17475423227813932112e43",
+      "subject": "Add explicit tensor sharding with atomic streaming export",
+      "author_name": "whjthu",
+      "author_email": "haojie0429@gmail.com",
+      "committer_name": "whjthu",
+      "committer_email": "haojie0429@gmail.com",
+      "identity_ok": true,
+      "single_english_subject_ok": true,
+      "exit_code": 0,
+      "elapsed_seconds": 30.45,
+      "log": "07-48615de-pytest.txt",
+      "summary": "102 passed in 27.24s",
+      "raw_pytest_sha256": "d73753398c5d1dbc093e837b2bf0cf7d6a9597e272876838c2f1fe9a3fe34ecd"
+    },
+    {
+      "step": 8,
+      "commit": "43d7a75dead6bcb4f7a82cc8734ef4622ce13333",
+      "subject": "Share sealed CPU tensors with live topology slicing",
+      "author_name": "whjthu",
+      "author_email": "haojie0429@gmail.com",
+      "committer_name": "whjthu",
+      "committer_email": "haojie0429@gmail.com",
+      "identity_ok": true,
+      "single_english_subject_ok": true,
+      "exit_code": 0,
+      "elapsed_seconds": 40.33,
+      "log": "08-43d7a75-pytest.txt",
+      "summary": "108 passed in 31.83s",
+      "raw_pytest_sha256": "b437bfedec5274814745face31df619df1e401776d8bc29e31f6e6cc814b92b2"
+    },
+    {
+      "step": 9,
+      "commit": "70c0979fd37c0a9a085a63312b3c2f3e47515bc9",
+      "subject": "Validate distributed TP and PP execution after coordinated preload",
+      "author_name": "whjthu",
+      "author_email": "haojie0429@gmail.com",
+      "committer_name": "whjthu",
+      "committer_email": "haojie0429@gmail.com",
+      "identity_ok": true,
+      "single_english_subject_ok": true,
+      "exit_code": 0,
+      "elapsed_seconds": 84.46,
+      "log": "09-70c0979-pytest.txt",
+      "summary": "116 passed in 78.24s (0:01:18)",
+      "raw_pytest_sha256": "a725e5a9dc829b1c817fc60240fc335f4074d53b48c5bf1d8f3a257f659d524a"
+    },
+    {
+      "step": 10,
+      "commit": "895c5efce64030dacc635eb26331d1aa606417b2",
+      "subject": "Manage GPU expert residency with CPU fallback and safe eviction",
+      "author_name": "whjthu",
+      "author_email": "haojie0429@gmail.com",
+      "committer_name": "whjthu",
+      "committer_email": "haojie0429@gmail.com",
+      "identity_ok": true,
+      "single_english_subject_ok": true,
+      "exit_code": 0,
+      "elapsed_seconds": 85.2,
+      "log": "10-895c5ef-pytest.txt",
+      "summary": "119 passed, 2 skipped in 80.49s (0:01:20)",
+      "raw_pytest_sha256": "13b46cb1a09aa63c5df2558ff6e45b3378869e3ced4f97a7ee5d8eb5fd556d7d"
+    }
+  ],
+  "original_to_new_steps": [
+    {
+      "original_commit": "2f7204be58a2c53d43117a8c1e5d90bba14c0125",
+      "new_steps": [
+        1
+      ],
+      "reason": "Startup serialization and runtime ownership"
+    },
+    {
+      "original_commit": "c67ba9eb9048f44d00f98b86cd8abdacf1c0446d",
+      "new_steps": [
+        1
+      ],
+      "reason": "Sealed immutable snapshots"
+    },
+    {
+      "original_commit": "deaa940d2178f0cb7d2211061a156f88068b9b71",
+      "new_steps": [
+        2
+      ],
+      "reason": "Bounded IPC and failed-rank cancellation"
+    },
+    {
+      "original_commit": "d7261009fe6da8bf1c09c9a813ceb43ce7c230dd",
+      "new_steps": [
+        1,
+        3
+      ],
+      "reason": "Identity rechecks moved to startup; verified disk generations"
+    },
+    {
+      "original_commit": "2f544804c91667c9af2d26e4d10b1260fdcd4de2",
+      "new_steps": [
+        4
+      ],
+      "reason": "Cgroup and shared resident budgets"
+    },
+    {
+      "original_commit": "fb2f0570b8ac62a83667534dbfc1030b3a54b96f",
+      "new_steps": [
+        5
+      ],
+      "reason": "Leased execution and diagnostics"
+    },
+    {
+      "original_commit": "8fab6cd5ff4d0b0fe640403c8d583c4c3e012f40",
+      "new_steps": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "reason": "Boundary, stop, GC and budget corrections folded into owners"
+    },
+    {
+      "original_commit": "a17a6e91f42cee30e6418a31a212a6143413501c",
+      "new_steps": [
+        5
+      ],
+      "reason": "Benchmark medians and cache uncertainty"
+    },
+    {
+      "original_commit": "6a33d83e2b6834302c63661e9c44e7099e2b0b56",
+      "new_steps": [
+        6
+      ],
+      "reason": "Operations and core CI"
+    },
+    {
+      "original_commit": "7e1b2485b7608ef4df8100aa2eb1384134757a81",
+      "new_steps": [
+        1,
+        2,
+        5
+      ],
+      "reason": "Runtime ownership, cancellation diagnostics and lease-safe stop"
+    },
+    {
+      "original_commit": "cc67790f7b4d65b20cbeef051f5ee9fc6189088c",
+      "new_steps": [
+        1,
+        3
+      ],
+      "reason": "Bounded copy buffers and complete disk generation verification"
+    },
+    {
+      "original_commit": "7442271c0698a9e50ebd07c00feb1dad95f7e198",
+      "new_steps": [
+        5,
+        6
+      ],
+      "reason": "Regression alignment and historical expert evidence"
+    },
+    {
+      "original_commit": "d8fe312a58ae612d6bfa25a3bf5ce76ddf0cc898",
+      "new_steps": [
+        7
+      ],
+      "reason": "Strict explicit sharding"
+    },
+    {
+      "original_commit": "4ab6d4a067ae41e764264162928498006f926d2b",
+      "new_steps": [
+        8
+      ],
+      "reason": "CPU TensorStore"
+    },
+    {
+      "original_commit": "674f16871907f489d3fa0ad4e12650874d330ed0",
+      "new_steps": [
+        10
+      ],
+      "reason": "GPU expert pool and hybrid reference"
+    },
+    {
+      "original_commit": "717997e5fa108f57f9efc646ad79da444fc52ae3",
+      "new_steps": [
+        9,
+        10
+      ],
+      "reason": "TP/PP tests; hybrid CI smoke kept with its example"
+    },
+    {
+      "original_commit": "123c6e2dd3f9e69a1df6cd9422d27ba0bd2628f5",
+      "new_steps": [
+        7
+      ],
+      "reason": "NFS publication fix included in initial shard feature"
+    },
+    {
+      "original_commit": "758f8c866a4de4dc4a8a9057ce14680e78e44b8d",
+      "new_steps": [
+        9
+      ],
+      "reason": "Startup barrier included in initial TP/PP harness"
+    },
+    {
+      "original_commit": "88d6bac6a80a424201da1688989d1d87e3217a93",
+      "new_steps": [
+        11
+      ],
+      "reason": "Distributed contracts, historical numerical evidence and README"
+    }
+  ],
+  "documentation_step": 11,
+  "documentation_commit": "The commit containing this file; inspect git log to avoid a self-referential hash.",
+  "historical_remote_tests": "Original measured commit IDs are preserved. No new GPU or four-node execution is claimed for this history rewrite.",
+  "independent_test_command": [
+    "python3",
+    "-B",
+    "-m",
+    "pytest",
+    "-q"
+  ],
+  "independent_test_environment": {
+    "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}
