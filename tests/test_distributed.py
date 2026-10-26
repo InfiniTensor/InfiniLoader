@@ -1,11 +1,29 @@
 from __future__ import annotations
 
 import os
+import json
+from pathlib import Path
 
 import pytest
 
 from conftest import make_model_dir, write_safetensors
 from infiniloader.distributed import build_tp_plan, create_rank_views, simulate_distributed_read
+
+
+@pytest.mark.skipif(os.name != "posix", reason="rank views use POSIX symlinks")
+def test_rank_view_can_be_used_as_read_only_source(tmp_path):
+    model = make_model_dir(tmp_path / "model")
+    first = create_rank_views(model, name="first", ranks=2, base_dir=tmp_path / "state")
+    source = Path(first["rank_paths"][0])
+    original = (source / ".iloader-dist/rank.json").read_bytes()
+    second = create_rank_views(source, name="second", ranks=3, base_dir=tmp_path / "state")
+    assert (source / ".iloader-dist/rank.json").read_bytes() == original
+    for rank, view in enumerate(second["rank_paths"]):
+        marker = Path(view) / ".iloader-dist/rank.json"
+        assert not marker.is_symlink()
+        assert json.loads(marker.read_text())["rank"] == rank
+        assert (Path(view) / "model.safetensors").read_bytes() == b"0123456789abcdef"
+    assert second["file_count"] == first["file_count"]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="rank views use POSIX symlinks")

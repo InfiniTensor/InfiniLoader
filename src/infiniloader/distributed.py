@@ -196,11 +196,12 @@ def create_rank_views(
                 "total_bytes": sum(item.size for item in files),
             }
             marker = rank_dir / ".iloader-dist"
-            marker.mkdir(exist_ok=True)
-            (marker / "rank.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+            marker.mkdir()
+            with (marker / "rank.json").open("x", encoding="utf-8") as stream:
+                json.dump(meta, stream, indent=2, sort_keys=True)
 
         root_marker = tmp / ".iloader-dist"
-        root_marker.mkdir(exist_ok=True)
+        root_marker.mkdir()
         manifest = {
             "name": name,
             "source": str(source),

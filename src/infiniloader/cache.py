@@ -26,6 +26,8 @@ DEFAULT_EXCLUDES = (
     "*/.cache/*",
     ".iloader-cache/*",
     "*/.iloader-cache/*",
+    ".iloader-dist/*",
+    "*/.iloader-dist/*",
     ".iloader/*",
     "*/.iloader/*",
     "*.lock",
