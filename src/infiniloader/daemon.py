@@ -12,6 +12,7 @@ import threading
 import uuid
 import stat
 import errno
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -298,13 +299,28 @@ class WeightLoaderDaemon:
     def _cleanup_socket(self) -> None:
         if not self._owns_runtime:
             return
+        complete = True
         for path, identity in self._claimed_runtime.items():
-            try:
-                st = path.lstat()
-                if (st.st_dev, st.st_ino) == identity:
-                    path.unlink()
-            except OSError:
-                pass
+            if path != self.state_path and not self._remove_claimed_runtime_file(path, identity):
+                complete = False
+        # State proves ownership on the next start. Keep it until all other
+        # claimed resources have been removed or confirmed absent.
+        if complete and self.state_path in self._claimed_runtime:
+            self._remove_claimed_runtime_file(self.state_path, self._claimed_runtime[self.state_path])
+
+    def _remove_claimed_runtime_file(self, path: Path, identity: tuple[int, int]) -> bool:
+        try:
+            st = path.lstat()
+            if (st.st_dev, st.st_ino) != identity or st.st_uid != os.getuid():
+                print(f"[cleanup] retained {path}: runtime ownership changed", file=sys.stderr, flush=True)
+                return False
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            print(f"[cleanup] retained {path}: {exc}", file=sys.stderr, flush=True)
+            return False
 
     def _claim_runtime_file(self, path: Path) -> None:
         st = path.lstat()
@@ -364,21 +380,31 @@ class WeightLoaderDaemon:
         # the old PID first avoids publishing a new state next to an old PID.
         if state:
             private = state.get("runtime_private_socket")
-            if isinstance(private, str):
+            if private is not None:
+                if not isinstance(private, str):
+                    raise RuntimeError("invalid private socket path in runtime state")
                 path = absolute_path(private)
-                if path.parent == self.socket_path.parent and path not in paths:
-                    try:
-                        st = path.lstat()
-                        expected = {"device": st.st_dev, "inode": st.st_ino}
-                        if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid() and expected == state.get("runtime_socket"):
-                            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-                                probe.settimeout(.2)
-                                try:
-                                    probe.connect(str(path))
-                                except ConnectionRefusedError:
-                                    self._remove_stale_file(path, st)
-                    except OSError:
-                        pass  # Preserve anything whose ownership/liveness is uncertain.
+                if path.parent != self.socket_path.parent or path in paths:
+                    raise RuntimeError("invalid private socket path in runtime state")
+                try:
+                    st = path.lstat()
+                except FileNotFoundError:
+                    st = None
+                if st is not None:
+                    expected = {"device": st.st_dev, "inode": st.st_ino}
+                    if (not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid()
+                            or expected != state.get("runtime_socket")):
+                        raise RuntimeError(f"private socket has no matching owned state: {path}")
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                        probe.settimeout(.2)
+                        try:
+                            probe.connect(str(path))
+                        except ConnectionRefusedError:
+                            self._remove_stale_file(path, st)
+                        except OSError as exc:
+                            raise RuntimeError(f"cannot establish that private socket is stale: {path}") from exc
+                        else:
+                            raise RuntimeError(f"private socket still has a listener: {path}")
         if stale_pid is not None:
             self._remove_stale_file(self.pid_path, stale_pid)
         if stale_socket is not None:
