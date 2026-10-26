@@ -6,8 +6,10 @@ import signal
 import stat
 import socket
 import time
-import traceback
 from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
+import struct
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +66,7 @@ class WeightLoaderDaemon:
         self._remove_view_on_exit = False
         self._claimed_runtime: dict[Path, tuple[int, int]] = {}
         self._socket_identity: dict | None = None
+        self._connections = threading.BoundedSemaphore(16)
 
     def log(self, message: str) -> None:
         if not self.quiet:
@@ -180,6 +183,41 @@ class WeightLoaderDaemon:
             return {"ok": True, "stopping": True}
         return {"ok": False, "error": f"unknown command: {command!r}"}
 
+    def _serve_connection(self, conn: socket.socket) -> None:
+        try:
+            with conn:
+                conn.settimeout(1.0)
+                if hasattr(socket, "SO_PEERCRED"):
+                    _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                    if uid != os.getuid():
+                        return
+                data = bytearray()
+                deadline = time.monotonic() + 1.0
+                while b"\n" not in data:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    conn.settimeout(remaining)
+                    chunk = conn.recv(min(65536 - len(data), 4096))
+                    if not chunk:
+                        return
+                    data.extend(chunk)
+                    if len(data) >= 65536:
+                        return
+                try:
+                    payload = json.loads(data.split(b"\n", 1)[0])
+                    if not isinstance(payload, dict):
+                        raise ValueError("request must be a JSON object")
+                    response = self._handle(payload)
+                except (ValueError, TypeError, RuntimeError) as exc:
+                    response = {"ok": False, "error": str(exc)}
+                conn.settimeout(1.0)
+                conn.sendall(json.dumps(response).encode("utf-8") + b"\n")
+        except OSError:
+            pass  # A stalled or disconnected client must not terminate the daemon.
+        finally:
+            self._connections.release()
+
     def _cleanup_socket(self) -> None:
         if not self._owns_runtime:
             return
@@ -281,6 +319,7 @@ class WeightLoaderDaemon:
         self._claim_runtime_file(self.pid_path)
 
         server: socket.socket | None = None
+        clients = ThreadPoolExecutor(max_workers=4, thread_name_prefix="iloader-ipc")
 
         try:
             self.load()
@@ -293,6 +332,7 @@ class WeightLoaderDaemon:
             self._claim_runtime_file(self.socket_path)
             st = self.socket_path.lstat()
             self._socket_identity = {"device": st.st_dev, "inode": st.st_ino}
+            os.chmod(self.socket_path, 0o600)
             server.listen(16)
             self._write_state({"state": "ready", "progress": 1.0,
                                "copied_bytes": self.cached.total_bytes, **self._status()})
@@ -303,22 +343,12 @@ class WeightLoaderDaemon:
                     conn, _ = server.accept()
                 except socket.timeout:
                     continue
-                with conn:
-                    data = bytearray()
-                    while True:
-                        chunk = conn.recv(65536)
-                        if not chunk:
-                            break
-                        data.extend(chunk)
-                        if b"\n" in chunk:
-                            break
-                    try:
-                        payload = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
-                        response = self._handle(payload)
-                    except Exception as exc:  # pragma: no cover - defensive server path
-                        response = {"ok": False, "error": str(exc), "traceback": traceback.format_exc()}
-                    conn.sendall(json.dumps(response).encode("utf-8") + b"\n")
+                if self._connections.acquire(blocking=False):
+                    clients.submit(self._serve_connection, conn)
+                else:
+                    conn.close()
         finally:
+            clients.shutdown(wait=True)
             if server is not None:
                 server.close()
             self._cleanup_socket()

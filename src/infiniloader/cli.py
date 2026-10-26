@@ -709,6 +709,7 @@ def cmd_dist_simulate(args: argparse.Namespace) -> int:
         include_patterns=_patterns(args.pattern) or ("*.safetensors",),
         exclude_patterns=tuple(args.exclude or DEFAULT_EXCLUDES),
         chunk_size=args.chunk_size,
+        timeout=args.timeout,
     )
     if args.json:
         _print_json(result)
@@ -927,6 +928,7 @@ def build_parser() -> argparse.ArgumentParser:
     dist_sim_p.add_argument("--pattern", action="append")
     dist_sim_p.add_argument("--exclude", action="append")
     dist_sim_p.add_argument("--chunk-size", type=int, default=64 * 1024 * 1024)
+    dist_sim_p.add_argument("--timeout", type=float, default=60.0)
     dist_sim_p.add_argument("--json", action="store_true")
     dist_sim_p.set_defaults(func=cmd_dist_simulate)
 
@@ -984,6 +986,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        for attribute in ("workers", "cache_workers", "chunk_size", "ranks", "tp", "repeat", "timeout", "wait_timeout"):
+            value = getattr(args, attribute, None)
+            if value is not None and value <= 0:
+                raise ValueError(f"{attribute} must be positive")
         for attribute in ("name", "name_arg"):
             if getattr(args, attribute, None):
                 validate_name(getattr(args, attribute))

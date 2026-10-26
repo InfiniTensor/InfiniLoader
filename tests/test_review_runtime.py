@@ -67,3 +67,12 @@ def test_shutdown_preserves_replaced_pid_file(tmp_path):
         request(state / "run/unit.sock", {"command": "stop"})
         proc.wait(timeout=4)
         assert (state / "run/unit.pid").read_text() == "unrelated replacement data"
+
+
+def test_dist_simulate_failure_text_has_all_paths(tmp_path, capsys):
+    make_model_dir(tmp_path / "rank0")
+    assert main(["dist-simulate", str(tmp_path), "--ranks", "2", "--rank-view-root", str(tmp_path), "--timeout", "2"]) == 1
+    output = capsys.readouterr()
+    assert "rank 0: failed" in output.out
+    assert "rank 1: failed" in output.out
+    assert "error: 'path'" not in output.err
