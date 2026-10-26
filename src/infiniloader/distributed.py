@@ -4,7 +4,6 @@ import json
 import multiprocessing as mp
 import os
 import shutil
-import struct
 import time
 import queue as queue_module
 import tempfile
@@ -15,25 +14,7 @@ from typing import Any
 from .cache import DEFAULT_EXCLUDES, collect_source_files, human_bytes
 from .paths import dist_view_root
 from .runtime import validate_name, read_json
-
-
-DTYPE_BYTES = {
-    "BOOL": 1,
-    "U8": 1,
-    "I8": 1,
-    "F8_E5M2": 1,
-    "F8_E4M3": 1,
-    "I16": 2,
-    "U16": 2,
-    "F16": 2,
-    "BF16": 2,
-    "I32": 4,
-    "U32": 4,
-    "F32": 4,
-    "F64": 8,
-    "I64": 8,
-    "U64": 8,
-}
+from .formats import DTYPE_BYTES, tensor_header, tensor_inventory
 
 
 @dataclass
@@ -55,35 +36,14 @@ class TensorInfo:
 
 
 def parse_safetensors_header(path: Path) -> dict[str, Any]:
-    with path.open("rb") as f:
-        raw_len = f.read(8)
-        if len(raw_len) != 8:
-            raise ValueError(f"{path} is too small to be safetensors")
-        (header_len,) = struct.unpack("<Q", raw_len)
-        if header_len > 100 * 1024 * 1024 or header_len > path.stat().st_size - 8:
-            raise ValueError(f"invalid safetensors header length: {path}")
-        header = f.read(header_len)
-    return json.loads(header.decode("utf-8"))
+    return tensor_header(path, include_metadata=True)[0]
 
 
 def collect_safetensors_metadata(model_dir: Path) -> list[TensorInfo]:
-    model_dir = model_dir.expanduser().resolve()
-    rows: list[TensorInfo] = []
-    for file_path in sorted(model_dir.glob("*.safetensors")):
-        header = parse_safetensors_header(file_path)
-        for name, item in header.items():
-            if name == "__metadata__":
-                continue
-            rows.append(
-                TensorInfo(
-                    file=file_path.relative_to(model_dir).as_posix(),
-                    name=name,
-                    dtype=item.get("dtype", ""),
-                    shape=list(item.get("shape", [])),
-                    data_offsets=list(item.get("data_offsets", [])),
-                )
-            )
-    return rows
+    _, tensors = tensor_inventory(model_dir)
+    return [TensorInfo(file=spec["file"], name=name, dtype=spec["dtype"],
+                       shape=spec["shape"], data_offsets=spec["data_offsets"])
+            for name, spec in tensors.items()]
 
 
 def infer_tp_split(tensor: TensorInfo, tp: int) -> dict[str, Any]:

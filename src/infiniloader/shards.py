@@ -17,28 +17,9 @@ import struct
 import tempfile
 from pathlib import Path
 
-from .distributed import DTYPE_BYTES
+from .formats import DTYPE_BYTES, MAX_HEADER, _signature, canonical, read_json, tensor_header, tensor_inventory
 
 CHUNK = 1024 * 1024
-MAX_HEADER = 100_000_000
-
-
-def _unique(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
-
-
-def read_json(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique)
-
-
-def canonical(value) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
-                      allow_nan=False).encode()
 
 
 def digest(value) -> str:
@@ -53,78 +34,28 @@ def file_hash(path: Path) -> str:
     return h.hexdigest()
 
 
-def _signature(path: Path):
-    s = path.stat()
-    return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns
-
-
 def _int(value, *, minimum=0):
     return type(value) is int and value >= minimum
-
-
-def tensor_header(path: Path) -> tuple[dict, int]:
-    """Reject holes, overlaps, truncated payloads and unsupported packed dtypes."""
-    with path.open("rb") as stream:
-        size = os.fstat(stream.fileno()).st_size
-        raw = stream.read(8)
-        if len(raw) != 8:
-            raise ValueError(f"truncated safetensors: {path}")
-        length, = struct.unpack("<Q", raw)
-        if not 2 <= length <= min(MAX_HEADER, size - 8):
-            raise ValueError(f"invalid safetensors header length: {path}")
-        header = json.loads(stream.read(length).decode("utf-8"), object_pairs_hook=_unique)
-    if not isinstance(header, dict):
-        raise ValueError("safetensors header must be an object")
-    metadata = header.pop("__metadata__", {})
-    if not isinstance(metadata, dict) or any(not isinstance(v, str) for v in metadata.values()):
-        raise ValueError("safetensors metadata must contain strings")
-    intervals = []
-    for name, spec in header.items():
-        if not name or not isinstance(spec, dict):
-            raise ValueError("invalid tensor record")
-        dtype, shape, offsets = spec.get("dtype"), spec.get("shape"), spec.get("data_offsets")
-        if dtype not in DTYPE_BYTES or not isinstance(shape, list) or not all(_int(d) for d in shape):
-            raise ValueError(f"unsupported dtype or shape: {name}")
-        if (not isinstance(offsets, list) or len(offsets) != 2
-                or not all(_int(v) for v in offsets) or offsets[1] < offsets[0]
-                or offsets[1] - offsets[0] != math.prod(shape) * DTYPE_BYTES[dtype]):
-            raise ValueError(f"invalid tensor offsets/size: {name}")
-        intervals.append(tuple(offsets))
-    end = 0
-    for start, stop in sorted(intervals):
-        if start != end:
-            raise ValueError("overlapping tensor data or hole in payload")
-        end = stop
-    if end != size - 8 - length:
-        raise ValueError("truncated or trailing safetensors payload")
-    return header, 8 + length
 
 
 def catalog(source: Path) -> dict:
     """Content identity is independent of hostname, inode and source directory."""
     source = source.expanduser().resolve()
-    files, tensors = {}, {}
     paths = sorted(source.rglob("*.safetensors"))
     signatures = {p: _signature(p) for p in paths}
-    for path in paths:
-        before = signatures[path]
-        header, base = tensor_header(path)
-        rel = path.relative_to(source).as_posix()
-        files[rel] = {"sha256": file_hash(path), "size": before[2], "data_start": base}
-        if before != _signature(path):
-            raise RuntimeError(f"source changed while cataloging: {path}")
-        for name, spec in header.items():
-            if name in tensors:
-                raise ValueError(f"duplicate tensor across files: {name}")
-            tensors[name] = dict(spec, file=rel)
-    if not files or not tensors:
-        raise ValueError("no safetensors tensors found")
     index_path = source / "model.safetensors.index.json"
-    if index_path.exists():
-        index = read_json(index_path)
-        if not isinstance(index, dict) or index.get("weight_map") != {n: t["file"] for n, t in tensors.items()}:
-            raise ValueError("safetensors index does not match tensor inventory")
-    if paths != sorted(source.rglob("*.safetensors")) or any(_signature(p) != s for p, s in signatures.items()):
+    index_signature = _signature(index_path) if index_path.exists() else None
+    files, tensors = tensor_inventory(source)
+    if set(files) != {p.relative_to(source).as_posix() for p in paths}:
+        raise RuntimeError("source inventory changed while cataloging")
+    for relative, record in files.items():
+        path = source / relative
+        record["sha256"] = file_hash(path)
+        if signatures[path] != _signature(path):
+            raise RuntimeError(f"source changed while cataloging: {path}")
+    if (paths != sorted(source.rglob("*.safetensors"))
+            or any(_signature(p) != s for p, s in signatures.items())
+            or (_signature(index_path) if index_path.exists() else None) != index_signature):
         raise RuntimeError("source inventory changed while cataloging")
     result = {"format": 1, "files": files, "tensors": tensors}
     result["content_id"] = digest(result)
