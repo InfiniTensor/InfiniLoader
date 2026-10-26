@@ -1,0 +1,69 @@
+"""Runtime and CLI regressions reproduced during independent expert review."""
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import time
+
+import pytest
+
+from conftest import make_model_dir
+from infiniloader.cli import main
+from infiniloader.ipc import request
+from infiniloader.runtime import process_token
+from test_lifecycle import running_daemon
+
+pytestmark = pytest.mark.skipif(not hasattr(os, "memfd_create"), reason="Linux review regressions")
+
+
+
+
+@pytest.mark.parametrize("option", ["--socket", "--pid-file", "--state-file"])
+@pytest.mark.parametrize("symlink", [False, True])
+def test_runtime_collisions_never_overwrite_ordinary_files(tmp_path, option, symlink):
+    model = make_model_dir(tmp_path / "model")
+    valuable = tmp_path / "important.txt"
+    valuable.write_text("preserve this data")
+    destination = tmp_path / "alias" if symlink else valuable
+    if symlink:
+        destination.symlink_to(valuable)
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+    result = subprocess.run([sys.executable, "-m", "infiniloader", "_serve", str(model), "--name", "unit",
+                             "--base-dir", str(tmp_path / "state"), option, str(destination)],
+                            env=env, capture_output=True, timeout=15)
+    assert result.returncode == 1, result.stderr.decode()
+    assert valuable.read_text() == "preserve this data"
+    if symlink:
+        assert destination.is_symlink()
+
+
+
+
+def test_existing_unrelated_unix_listener_is_preserved(tmp_path):
+    model = make_model_dir(tmp_path / "model")
+    path = tmp_path / "service.sock"
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(str(path))
+        server.listen(1)
+        inode = path.stat().st_ino
+        result = subprocess.run([sys.executable, "-m", "infiniloader", "_serve", str(model),
+                                 "--name", "unit", "--base-dir", str(tmp_path / "state"), "--socket", str(path)],
+                                capture_output=True, env=env, timeout=15)
+        assert result.returncode == 1
+        assert path.stat().st_ino == inode
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(path))
+        connection, _ = server.accept()
+        connection.close()
+
+
+def test_shutdown_preserves_replaced_pid_file(tmp_path):
+    with running_daemon(tmp_path, make_model_dir(tmp_path / "model")) as (proc, state):
+        replacement = tmp_path / "replacement"
+        replacement.write_text("unrelated replacement data")
+        replacement.replace(state / "run/unit.pid")
+        request(state / "run/unit.sock", {"command": "stop"})
+        proc.wait(timeout=4)
+        assert (state / "run/unit.pid").read_text() == "unrelated replacement data"

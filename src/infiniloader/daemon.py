@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 import os
 import signal
+import stat
 import socket
 import time
 import traceback
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
-from .cache import CachedModel, build_view, human_bytes, load_model_into_memory
+from .cache import CachedModel, build_view, human_bytes, load_model_into_memory, source_identity, _safe_remove_view
+from .runtime import FileLock, atomic_json, atomic_text, process_matches, read_json, process_token
 
 
 class WeightLoaderDaemon:
@@ -32,6 +35,7 @@ class WeightLoaderDaemon:
         chunk_size: int,
         workers: int,
         quiet: bool = False,
+        identity: dict | None = None,
     ) -> None:
         self.name = name
         self.source = source
@@ -49,12 +53,17 @@ class WeightLoaderDaemon:
         self.chunk_size = chunk_size
         self.workers = workers
         self.quiet = quiet
+        self.identity = identity or {}
+        self.process_token = process_token(os.getpid())
+        self._owns_runtime = False
         self.cached: CachedModel | None = None
         self.started_at = time.time()
         self.load_started_at: float | None = None
         self.load_finished_at: float | None = None
         self._stop = False
         self._remove_view_on_exit = False
+        self._claimed_runtime: dict[Path, tuple[int, int]] = {}
+        self._socket_identity: dict | None = None
 
     def log(self, message: str) -> None:
         if not self.quiet:
@@ -62,15 +71,17 @@ class WeightLoaderDaemon:
 
     def _write_state(self, state: dict[str, Any]) -> None:
         state.setdefault("name", self.name)
+        state.setdefault("runtime_format", 1)
         state.setdefault("pid", os.getpid())
         state.setdefault("source", str(self.source))
         state.setdefault("view", str(self.view))
         state.setdefault("socket", str(self.socket_path))
         state.setdefault("started_at", self.started_at)
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_name(f".{self.state_path.name}.tmp.{os.getpid()}")
-        tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(tmp, self.state_path)
+        state.setdefault("identity", self.identity)
+        state.setdefault("process_token", self.process_token)
+        state.setdefault("runtime_socket", self._socket_identity)
+        atomic_json(self.state_path, state)
+        self._claim_runtime_file(self.state_path)
 
     def _progress(self, copied: int, total: int, rel: Path) -> None:
         pct = copied / total * 100 if total else 100.0
@@ -135,6 +146,8 @@ class WeightLoaderDaemon:
         assert self.cached is not None
         return {
             "name": self.name,
+            "identity": self.identity,
+            "process_token": self.process_token,
             "pid": os.getpid(),
             "source": str(self.source),
             "upstream_source": str(self.upstream_source) if self.upstream_source else None,
@@ -168,21 +181,67 @@ class WeightLoaderDaemon:
         return {"ok": False, "error": f"unknown command: {command!r}"}
 
     def _cleanup_socket(self) -> None:
-        try:
-            if self.socket_path.exists() or self.socket_path.is_socket():
-                self.socket_path.unlink()
-        except OSError:
-            pass
-        try:
-            if self.pid_path.exists():
-                self.pid_path.unlink()
-        except OSError:
-            pass
-        try:
-            if self.state_path.exists():
-                self.state_path.unlink()
-        except OSError:
-            pass
+        if not self._owns_runtime:
+            return
+        for path, identity in self._claimed_runtime.items():
+            try:
+                st = path.lstat()
+                if (st.st_dev, st.st_ino) == identity:
+                    path.unlink()
+            except OSError:
+                pass
+
+    def _claim_runtime_file(self, path: Path) -> None:
+        st = path.lstat()
+        self._claimed_runtime[path] = (st.st_dev, st.st_ino)
+
+    def _check_runtime_paths(self) -> None:
+        paths = (self.socket_path, self.pid_path, self.state_path)
+        if len({path.absolute() for path in paths}) != len(paths):
+            raise RuntimeError("socket, PID and state paths must be distinct")
+        for path in paths:
+            for source in (self.source, self.upstream_source):
+                if source and path.resolve().is_relative_to(source.resolve()):
+                    raise RuntimeError(f"runtime files must be outside the model directory: {path}")
+            if path.is_symlink():
+                raise RuntimeError(f"refusing to replace a runtime symlink: {path}")
+        if self.socket_path.exists() and not self.socket_path.is_socket():
+            raise RuntimeError(f"refusing to replace a non-socket file: {self.socket_path}")
+        for path in (self.pid_path, self.state_path):
+            if path.exists() and not stat.S_ISREG(path.lstat().st_mode):
+                raise RuntimeError(f"runtime metadata must be a regular file: {path}")
+        for path in paths:
+            if path.exists() and path.lstat().st_uid != os.getuid():
+                raise RuntimeError(f"runtime path belongs to another user: {path}")
+        state = read_json(self.state_path)
+        if self.state_path.exists():
+            if (not state or state.get("runtime_format") != 1 or state.get("name") != self.name
+                    or state.get("socket") != str(self.socket_path) or not isinstance(state.get("pid"), int)):
+                raise RuntimeError(f"refusing to overwrite unverified runtime state: {self.state_path}")
+            if process_matches(state["pid"], state.get("process_token")):
+                raise RuntimeError("runtime metadata belongs to a live daemon")
+        if self.pid_path.exists():
+            try:
+                pid = int(self.pid_path.read_text().strip())
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"refusing to overwrite an unverified PID file: {self.pid_path}") from exc
+            if not state or pid != state.get("pid") or state.get("runtime_format") != 1:
+                raise RuntimeError(f"PID file has no matching owned state: {self.pid_path}")
+        if self.socket_path.exists():
+            st = self.socket_path.lstat()
+            if not state or state.get("runtime_socket") != {"device": st.st_dev, "inode": st.st_ino}:
+                raise RuntimeError(f"socket has no matching owned state: {self.socket_path}")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(.2)
+                try:
+                    probe.connect(str(self.socket_path))
+                except ConnectionRefusedError:
+                    pass  # Only a verified, non-listening endpoint may be reclaimed.
+                except OSError as exc:
+                    raise RuntimeError(f"cannot establish that runtime socket is stale: {self.socket_path}") from exc
+                else:
+                    raise RuntimeError(f"runtime socket still has a listener: {self.socket_path}")
+
 
     def _install_signal_handlers(self) -> None:
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -196,24 +255,47 @@ class WeightLoaderDaemon:
         self._stop = True
 
     def serve_forever(self) -> int:
+        with ExitStack() as locks:
+            locks.enter_context(FileLock(self.socket_path.with_suffix(".owner.lock"), timeout=0))
+            locks.enter_context(FileLock(self.view.parent / f".{self.view.name}.owner.lock", timeout=0))
+            for path in (self.pid_path, self.state_path):
+                locks.enter_context(FileLock(path.with_name(f".{path.name}.owner.lock"), timeout=0))
+            self._check_runtime_paths()
+            self._owns_runtime = True
+            try:
+                return self._serve_owned()
+            finally:
+                self._owns_runtime = False
+
+    def _serve_owned(self) -> int:
+        if not self.identity:
+            self.identity = source_identity(self.upstream_source or self.source, self.include_patterns, self.exclude_patterns)
         self._install_signal_handlers()
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         self.pid_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         if self.socket_path.exists():
             self.socket_path.unlink()
-        self.pid_path.write_text(str(os.getpid()), encoding="utf-8")
         self._write_state({"state": "starting"})
+        atomic_text(self.pid_path, str(os.getpid()))
+        self._claim_runtime_file(self.pid_path)
 
         server: socket.socket | None = None
 
         try:
             self.load()
+            if source_identity(self.upstream_source or self.source, self.include_patterns, self.exclude_patterns) != self.identity:
+                raise RuntimeError("source model changed during startup; stop and retry")
 
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             server.settimeout(1.0)
             server.bind(str(self.socket_path))
+            self._claim_runtime_file(self.socket_path)
+            st = self.socket_path.lstat()
+            self._socket_identity = {"device": st.st_dev, "inode": st.st_ino}
             server.listen(16)
+            self._write_state({"state": "ready", "progress": 1.0,
+                               "copied_bytes": self.cached.total_bytes, **self._status()})
             self.log(f"[listen] socket={self.socket_path}")
 
             while not self._stop:
@@ -243,11 +325,9 @@ class WeightLoaderDaemon:
             if self.cached is not None:
                 self.cached.close()
             if self._remove_view_on_exit:
-                import shutil
-
                 try:
-                    shutil.rmtree(self.view)
-                except OSError:
-                    pass
+                    _safe_remove_view(self.view, expected_pid=os.getpid())
+                except (OSError, RuntimeError) as exc:
+                    self.log(f"[cleanup] {exc}")
             self.log("[stop] daemon exited")
         return 0

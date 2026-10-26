@@ -7,10 +7,12 @@ import os
 import shutil
 import stat
 import time
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
+from .runtime import read_json
 
 
 DEFAULT_EXCLUDES = (
@@ -39,6 +41,9 @@ class SourceFile:
     size: int
     mode: int
     mtime_ns: int
+    ctime_ns: int = 0
+    device: int = 0
+    inode: int = 0
 
     @property
     def rel_posix(self) -> str:
@@ -56,8 +61,9 @@ class CachedFile:
         return f"/proc/{os.getpid()}/fd/{self.fd}"
 
     def close(self) -> None:
+        fd, self.fd = self.fd, -1
         try:
-            os.close(self.fd)
+            os.close(fd)
         except OSError:
             pass
 
@@ -148,16 +154,15 @@ def collect_source_files(
 
     files: list[SourceFile] = []
     for path in sorted(source_root.rglob("*")):
-        try:
-            st = path.stat()
-        except OSError:
-            continue
-        if not stat.S_ISREG(st.st_mode):
-            continue
         rel = path.relative_to(source_root)
         if not should_include(rel, include_patterns, exclude_patterns):
             continue
-        files.append(SourceFile(path=path, rel=rel, size=st.st_size, mode=st.st_mode, mtime_ns=st.st_mtime_ns))
+        st = path.stat()
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        files.append(SourceFile(path=path, rel=rel, size=st.st_size, mode=st.st_mode,
+                                mtime_ns=st.st_mtime_ns, ctime_ns=st.st_ctime_ns,
+                                device=st.st_dev, inode=st.st_ino))
     return files
 
 
@@ -184,6 +189,19 @@ def inspect_source(
     }
 
 
+def source_identity(source_root: Path, include_patterns: tuple[str, ...] = (),
+                    exclude_patterns: tuple[str, ...] = DEFAULT_EXCLUDES) -> dict:
+    root = source_root.expanduser().resolve()
+    files = collect_source_files(root, include_patterns, exclude_patterns)
+    description = {
+        "source_root": str(root), "include_patterns": list(include_patterns),
+        "exclude_patterns": list(exclude_patterns),
+        "files": [(f.rel_posix, f.size, f.mtime_ns, f.ctime_ns, f.device, f.inode) for f in files],
+    }
+    return {"source_root": str(root), "fingerprint": hashlib.sha256(
+        json.dumps(description, sort_keys=True).encode()).hexdigest()}
+
+
 def _memfd_name(rel: Path) -> str:
     rel_text = rel.as_posix()
     digest = hashlib.sha1(rel_text.encode("utf-8")).hexdigest()[:12]
@@ -207,7 +225,7 @@ def _copy_with_copy_file_range(src_fd: int, dst_fd: int, size: int, chunk_size: 
 
 def _copy_with_read_write(src_fd: int, dst_fd: int, size: int, chunk_size: int) -> int:
     copied = 0
-    while True:
+    while copied < size:
         data = os.read(src_fd, min(chunk_size, max(size - copied, 1)))
         if not data:
             break
@@ -216,6 +234,7 @@ def _copy_with_read_write(src_fd: int, dst_fd: int, size: int, chunk_size: int) 
             written = os.write(dst_fd, view)
             view = view[written:]
         copied += len(data)
+        del view, data
     return copied
 
 
@@ -223,11 +242,20 @@ def copy_file_to_memfd(source: SourceFile, chunk_size: int = 64 * 1024 * 1024) -
     if not hasattr(os, "memfd_create"):
         raise RuntimeError("memfd_create is not available; InfiniLoader requires Linux")
 
-    flags = getattr(os, "MFD_CLOEXEC", 0)
-    dst_fd = os.memfd_create(_memfd_name(source.rel), flags)
-    digest = hashlib.sha256()
+    import fcntl
+
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
     src_fd = os.open(source.path, os.O_RDONLY)
+    dst_fd = None
     try:
+        before = os.fstat(src_fd)
+        if (before.st_size, before.st_mtime_ns) != (source.size, source.mtime_ns):
+            raise RuntimeError(f"source changed before preload: {source.path}")
+        if source.inode and (before.st_dev, before.st_ino, before.st_ctime_ns) != (source.device, source.inode, source.ctime_ns):
+            raise RuntimeError(f"source replaced before preload: {source.path}")
+        flags = os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+        dst_fd = os.memfd_create(_memfd_name(source.rel), flags)
         copied = 0
         try:
             copied = _copy_with_copy_file_range(src_fd, dst_fd, source.size, chunk_size)
@@ -244,17 +272,31 @@ def copy_file_to_memfd(source: SourceFile, chunk_size: int = 64 * 1024 * 1024) -
 
         if copied != source.size:
             raise IOError(f"short copy for {source.path}: {copied} != {source.size}")
+        after = os.fstat(src_fd)
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise RuntimeError(f"source changed during preload: {source.path}")
 
         os.lseek(dst_fd, 0, os.SEEK_SET)
         # Hash only a small prefix for diagnostics; full hashing doubles load time.
-        prefix = os.read(dst_fd, min(source.size, 1024 * 1024))
-        digest.update(prefix)
+        digest = hashlib.sha256()
+        remaining = min(source.size, 1024 * 1024)
+        while remaining:
+            data = os.read(dst_fd, min(chunk_size, remaining))
+            if not data:
+                raise IOError("short read while hashing cached prefix")
+            digest.update(data)
+            remaining -= len(data)
+            del data
         os.lseek(dst_fd, 0, os.SEEK_SET)
         os.ftruncate(dst_fd, source.size)
+        fcntl.fcntl(dst_fd, fcntl.F_ADD_SEALS,
+                    fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+        os.fchmod(dst_fd, 0o400)
         return CachedFile(source=source, fd=dst_fd, digest_prefix=digest.hexdigest()[:16])
     except Exception:
         try:
-            os.close(dst_fd)
+            if dst_fd is not None:
+                os.close(dst_fd)
         finally:
             raise
     finally:
@@ -271,6 +313,8 @@ def load_model_into_memory(
     chunk_size: int = 64 * 1024 * 1024,
     workers: int = 1,
 ) -> CachedModel:
+    if chunk_size <= 0 or workers < 1 or not 0 < max_memory_fraction <= 1:
+        raise ValueError("chunk_size and workers must be positive; memory fraction must be in (0, 1]")
     source_root = source_root.expanduser().resolve()
     source_files = collect_source_files(source_root, include_patterns, exclude_patterns)
     total = sum(item.size for item in source_files)
@@ -311,6 +355,8 @@ def load_model_into_memory(
                     copied += item.size
                     if progress:
                         progress(copied, total, item.rel)
+        if collect_source_files(source_root, include_patterns, exclude_patterns) != source_files:
+            raise RuntimeError("source model changed during preload; retry using an immutable model revision")
         cached = [item for item in cached_by_index if item is not None]
         return CachedModel(
             source_root=source_root,
@@ -340,38 +386,30 @@ def load_model_into_memory(
         raise
 
 
-def _safe_remove_view(path: Path) -> None:
+def _safe_remove_view(path: Path, expected_pid: int | None = None) -> None:
     if not path.exists() and not path.is_symlink():
         return
     resolved = path.resolve(strict=False)
     if str(resolved) in {"/", str(Path.home())}:
         raise RuntimeError(f"refusing to remove unsafe view path {path}")
-    is_tmp = ".tmp." in path.name
-    is_iloader_view = (path / ".iloader" / "manifest.json").exists() if path.is_dir() else False
-    if path.is_dir() and not is_tmp and not is_iloader_view:
-        try:
-            path.rmdir()
-            return
-        except OSError as exc:
-            raise RuntimeError(f"refusing to remove non-InfiniLoader directory {path}") from exc
-    if path.is_symlink() or path.is_file():
-        if not is_tmp:
-            raise RuntimeError(f"refusing to remove non-InfiniLoader file {path}")
-        path.unlink()
-    else:
-        shutil.rmtree(path)
+    manifest = read_json(path / ".iloader" / "manifest.json") if path.is_dir() else None
+    if path.is_symlink() or not manifest or manifest.get("format_version") != 1:
+        raise RuntimeError(f"refusing to remove non-InfiniLoader directory {path}")
+    if expected_pid is not None and manifest.get("daemon_pid") != expected_pid:
+        raise RuntimeError(f"view belongs to another daemon: {path}")
+    shutil.rmtree(path)
 
 
 def build_view(cached: CachedModel, view_path: Path, replace: bool = False) -> Path:
-    view_path = view_path.expanduser().resolve(strict=False)
-    if view_path == cached.source_root:
-        raise RuntimeError("view path must be different from source model path")
+    view_path = view_path.expanduser().absolute()
+    if view_path.is_symlink():
+        raise RuntimeError("view path must not be a symlink")
+    if view_path.resolve().is_relative_to(cached.source_root) or cached.source_root.is_relative_to(view_path.resolve()):
+        raise RuntimeError("view and source model directories must not overlap")
     parent = view_path.parent
     parent.mkdir(parents=True, exist_ok=True)
 
-    tmp_path = parent / f".{view_path.name}.tmp.{os.getpid()}"
-    _safe_remove_view(tmp_path)
-    tmp_path.mkdir(parents=True, exist_ok=False)
+    tmp_path = Path(tempfile.mkdtemp(prefix=f".{view_path.name}.tmp.", dir=parent))
 
     try:
         for item in cached.files:
@@ -391,5 +429,5 @@ def build_view(cached: CachedModel, view_path: Path, replace: bool = False) -> P
         os.replace(tmp_path, view_path)
         return view_path
     except Exception:
-        _safe_remove_view(tmp_path)
+        shutil.rmtree(tmp_path)
         raise

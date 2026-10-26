@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
+from .runtime import validate_name
 
 
 APP_DIR_NAME = "infiniloader"
@@ -10,10 +12,8 @@ APP_DIR_NAME = "infiniloader"
 def _writable_dir(path: Path) -> bool:
     try:
         path.mkdir(parents=True, exist_ok=True)
-        probe = path / ".write-test"
-        with probe.open("w", encoding="utf-8") as f:
-            f.write("ok")
-        probe.unlink(missing_ok=True)
+        with tempfile.TemporaryFile(dir=path) as f:
+            f.write(b"ok")
         return True
     except OSError:
         return False
@@ -35,8 +35,8 @@ def default_base_dir() -> Path:
     for candidate in candidates:
         if _writable_dir(candidate):
             return candidate
-    fallback = Path(os.environ.get("TMPDIR", "/tmp")) / APP_DIR_NAME
-    fallback.mkdir(parents=True, exist_ok=True)
+    fallback = Path(os.environ.get("TMPDIR", "/tmp")) / f"{APP_DIR_NAME}-{os.getuid()}"
+    fallback.mkdir(parents=True, exist_ok=True, mode=0o700)
     return fallback
 
 
@@ -76,20 +76,25 @@ def model_cache_root(base_dir: str | os.PathLike[str] | None = None) -> Path:
 
 
 def default_socket_path(name: str, base_dir: str | os.PathLike[str] | None = None) -> Path:
+    validate_name(name)
     return runtime_dir(base_dir) / f"{name}.sock"
 
 
 def default_pid_path(name: str, base_dir: str | os.PathLike[str] | None = None) -> Path:
+    validate_name(name)
     return runtime_dir(base_dir) / f"{name}.pid"
 
 
 def default_state_path(name: str, base_dir: str | os.PathLike[str] | None = None) -> Path:
+    validate_name(name)
     return runtime_dir(base_dir) / f"{name}.state.json"
 
 
 def default_log_path(name: str, base_dir: str | os.PathLike[str] | None = None) -> Path:
+    validate_name(name)
     return logs_dir(base_dir) / f"{name}.log"
 
 
 def default_view_path(name: str, base_dir: str | os.PathLike[str] | None = None) -> Path:
+    validate_name(name)
     return view_root(base_dir) / name

@@ -13,7 +13,8 @@ from pathlib import Path
 
 from . import __version__
 from .benchmark import benchmark_path
-from .cache import DEFAULT_EXCLUDES, build_view, human_bytes, inspect_source, load_model_into_memory
+from .cache import DEFAULT_EXCLUDES, build_view, human_bytes, inspect_source, load_model_into_memory, source_identity, _safe_remove_view
+from .runtime import FileLock, process_matches, read_json, signal_owned_process, validate_name
 from .daemon import WeightLoaderDaemon
 from .distributed import build_tp_plan, create_rank_views, simulate_distributed_read
 from .ipc import LoaderConnectionError, request
@@ -106,6 +107,8 @@ def _starting_status(args: argparse.Namespace, error: Exception) -> dict | None:
         result.update(state)
         result["state"] = state.get("state") or "starting"
         result["pid"] = pid
+    if not state or not process_matches(pid, state.get("process_token")):
+        return None
     return result
 
 
@@ -234,6 +237,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         chunk_size=args.chunk_size,
         workers=args.workers,
         quiet=args.quiet,
+        identity=json.loads(args.identity) if getattr(args, "identity", None) else None,
     )
     return daemon.serve_forever()
 
@@ -274,80 +278,82 @@ def _daemon_command(args: argparse.Namespace, model_path: Path | None = None, up
         command.extend(["--exclude", pattern])
     if args.force:
         command.append("--force")
+    command.extend(["--identity", json.dumps(args.identity, sort_keys=True)])
     return command
 
 
 def cmd_start(args: argparse.Namespace) -> int:
+    args.identity = source_identity(Path(args.model), _patterns(args.pattern), tuple(args.exclude or DEFAULT_EXCLUDES))
+    with FileLock(_socket(args).with_suffix(".start.lock"), timeout=args.wait_timeout):
+        return _start_locked(args)
+
+
+def _require_identity(args: argparse.Namespace, status: dict) -> None:
+    if status.get("identity") != args.identity:
+        raise RuntimeError("name already belongs to a different model, revision or file selection; use another name or stop it first")
+    if args.view and Path(status["view"]).absolute() != Path(args.view).expanduser().absolute():
+        raise RuntimeError("name already belongs to a different view path")
+    if args.refresh_cache:
+        raise RuntimeError("stop the running cache before requesting --refresh-cache")
+
+
+def _start_locked(args: argparse.Namespace) -> int:
     sock = _socket(args)
     try:
         status = request(sock, {"command": "status"}, timeout=1.0)["status"]
+    except LoaderConnectionError:
+        status = None
+    if status is not None:
+        _require_identity(args, status)
         print(status["view"])
         print(f"already running: name={args.name} pid={status['pid']}", file=sys.stderr)
         return 0
-    except Exception:
-        pass
+    starting = _starting_status(args, LoaderConnectionError("not ready"))
+    proc = None
+    if starting:
+        _require_identity(args, starting)
+        if args.no_wait:
+            print(starting["view"])
+            return 0
+    else:
+        source, upstream_source, local_cache_path = _prepare_model_source(args)
+        if source_identity(Path(args.model), _patterns(args.pattern), tuple(args.exclude or DEFAULT_EXCLUDES)) != args.identity:
+            raise RuntimeError("source model changed while preparing local cache; retry")
+        log_path = Path(args.log_file).expanduser() if args.log_file else default_log_path(args.name, getattr(args, "base_dir", None))
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("ab", buffering=0) as log:
+            proc = subprocess.Popen(
+                _daemon_command(args, source, upstream_source, local_cache_path),
+                stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                start_new_session=True, close_fds=True,
+            )
+        print(f"starting name={args.name} pid={proc.pid} log={log_path}", file=sys.stderr)
 
-    source, upstream_source, local_cache_path = _prepare_model_source(args)
-    log_path = Path(args.log_file).expanduser() if args.log_file else default_log_path(args.name, getattr(args, "base_dir", None))
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log = log_path.open("ab", buffering=0)
-    proc = subprocess.Popen(
-        _daemon_command(args, source, upstream_source, local_cache_path),
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
-    pid_path = _pid(args)
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(str(proc.pid), encoding="utf-8")
-    state_path = _state(args)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(
-        json.dumps(
-            {
-                "name": args.name,
-                "pid": proc.pid,
-                "state": "starting",
-                "view": str(_view(args)),
-                "socket": str(_socket(args)),
-                "log": str(log_path),
-                "started_at": time.time(),
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    print(f"starting name={args.name} pid={proc.pid} log={log_path}", file=sys.stderr)
-    if args.no_wait:
-        print(_view(args))
-        return 0
-
-    deadline = time.time() + args.wait_timeout
+    deadline = time.monotonic() + args.wait_timeout
     last_progress = None
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            if sys.stderr.isatty() and last_progress:
-                print(file=sys.stderr)
-            print(f"daemon exited with code {proc.returncode}; see {log_path}", file=sys.stderr)
-            return proc.returncode or 1
+    while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(f"daemon exited with code {proc.returncode}; see {log_path}")
+        if args.no_wait:
+            registered = _starting_status(args, LoaderConnectionError("not ready"))
+            if registered and registered["pid"] == proc.pid:
+                _require_identity(args, registered)
+                print(registered["view"])
+                return 0
         try:
             status = request(sock, {"command": "status"}, timeout=1.0)["status"]
+        except LoaderConnectionError:
             last_progress = _print_progress_update(args, last_progress)
-            if sys.stderr.isatty() and last_progress:
-                print(file=sys.stderr)
-            print(status["view"])
-            return 0
-        except Exception:
-            last_progress = _print_progress_update(args, last_progress)
-            time.sleep(1.0)
-    if sys.stderr.isatty() and last_progress:
-        print(file=sys.stderr)
-    print(f"timeout waiting for daemon readiness; pid={proc.pid} log={log_path}", file=sys.stderr)
-    print(_view(args))
-    return 2
+            if proc is None and not _starting_status(args, LoaderConnectionError("not ready")):
+                raise RuntimeError("daemon exited before becoming ready")
+            time.sleep(0.1)
+            continue
+        _require_identity(args, status)
+        if sys.stderr.isatty() and last_progress:
+            print(file=sys.stderr)
+        print(status["view"])
+        return 0
+    raise TimeoutError("timeout waiting for daemon readiness; inspect status and log before retrying")
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -476,9 +482,18 @@ def _stop_one(args: argparse.Namespace) -> int:
         if not starting:
             print(f"{args.name}: {exc}", file=sys.stderr)
             return 1
-        os.kill(int(starting["pid"]), signal.SIGTERM)
+        if starting.get("state") not in ("starting", "loading") and not getattr(args, "force", False):
+            raise RuntimeError("ready daemon is unresponsive; no signal was sent, retry or use stop --force")
+        signal_owned_process(int(starting["pid"]), starting.get("process_token"))
         if args.remove_view:
-            shutil.rmtree(_view(args), ignore_errors=True)
+            deadline = time.monotonic() + args.timeout
+            while process_matches(int(starting["pid"]), starting.get("process_token")):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("daemon has not exited; view was preserved")
+                time.sleep(.05)
+            view = Path(starting["view"])
+            if view.exists():
+                _safe_remove_view(view, expected_pid=int(starting["pid"]))
         print(f"{args.name}: stopping pid={starting['pid']}")
         return 0
 
@@ -505,7 +520,11 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 timeout=args.timeout,
                 remove_view=args.remove_view,
             )
-            rc = max(rc, _stop_one(ns))
+            try:
+                rc = max(rc, _stop_one(ns))
+            except (RuntimeError, OSError, ValueError) as exc:
+                print(f"{row['name']}: {exc}", file=sys.stderr)
+                rc = max(rc, 1)
         return rc
     return _stop_one(args)
 
@@ -813,6 +832,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("--base-dir")
     serve_p.add_argument("--upstream-source", help=argparse.SUPPRESS)
     serve_p.add_argument("--local-cache-path", help=argparse.SUPPRESS)
+    serve_p.add_argument("--identity", help=argparse.SUPPRESS)
     serve_p.add_argument("--pattern", action="append")
     serve_p.add_argument("--exclude", action="append")
     serve_p.add_argument("--replace", action="store_true")
@@ -964,6 +984,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        for attribute in ("name", "name_arg"):
+            if getattr(args, attribute, None):
+                validate_name(getattr(args, attribute))
         return int(args.func(args))
     except KeyboardInterrupt:
         return 130

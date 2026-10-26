@@ -39,6 +39,9 @@ def test_signal_during_load_exits_immediately_and_cleans_runtime_files(tmp_path,
         chunk_size=1024,
         workers=1,
     )
+    daemon._owns_runtime = True
+    daemon._claim_runtime_file(pid_path)
+    daemon._claim_runtime_file(state_path)
 
     with pytest.raises(SystemExit):
         daemon._handle_signal(signal.SIGTERM, None)
