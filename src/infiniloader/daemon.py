@@ -3,18 +3,19 @@ from __future__ import annotations
 import json
 import os
 import signal
-import stat
 import socket
 import time
 from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
 import struct
 import threading
+import uuid
+import stat
 from pathlib import Path
 from typing import Any
 
 from .cache import CachedModel, build_view, human_bytes, load_model_into_memory, source_identity, _safe_remove_view, collect_source_files
-from .runtime import FileLock, atomic_json, atomic_text, process_matches, read_json, process_token
+from .runtime import FileLock, atomic_json, atomic_text, process_token, process_matches, read_json
 from .local_cache import lease_path, verify_cache
 from .memory import ResidentReservation
 
@@ -43,6 +44,7 @@ class WeightLoaderDaemon:
         max_memory_bytes: int | None = None,
         reserve_bytes: int = 256 * 1024 * 1024,
         max_resident_bytes: int | None = None,
+        idle_ttl: float | None = None,
     ) -> None:
         self.name = name
         self.source = source
@@ -66,15 +68,21 @@ class WeightLoaderDaemon:
         self.max_memory_bytes, self.reserve_bytes = max_memory_bytes, reserve_bytes
         self.max_resident_bytes = max_resident_bytes
         self._reservation = None
+        self.idle_ttl = idle_ttl
+        self._management_lock = threading.RLock()
+        self._leases: dict[str, dict] = {}
+        self.last_used_at = time.time()
+        self._last_use = time.monotonic()
+        self.reuse_requests = 0
         self.cached: CachedModel | None = None
         self.started_at = time.time()
         self.load_started_at: float | None = None
         self.load_finished_at: float | None = None
         self._stop = False
         self._remove_view_on_exit = False
+        self._connections = threading.BoundedSemaphore(16)
         self._claimed_runtime: dict[Path, tuple[int, int]] = {}
         self._socket_identity: dict | None = None
-        self._connections = threading.BoundedSemaphore(16)
 
     def log(self, message: str) -> None:
         if not self.quiet:
@@ -90,6 +98,7 @@ class WeightLoaderDaemon:
         state.setdefault("started_at", self.started_at)
         state.setdefault("identity", self.identity)
         state.setdefault("process_token", self.process_token)
+        state.setdefault("idle_ttl", self.idle_ttl)
         state.setdefault("memory_budget", self._reservation.info if self._reservation else None)
         state.setdefault("runtime_socket", self._socket_identity)
         atomic_json(self.state_path, state)
@@ -180,10 +189,28 @@ class WeightLoaderDaemon:
             "memory_budget": self._reservation.info if self._reservation else None,
             "sealed": True,
             "physical_residency_guaranteed": False,
+            "idle_ttl": self.idle_ttl,
+            "last_used_at": self.last_used_at,
+            "active_leases": len(self._active_leases()),
+            "reuse_requests": self.reuse_requests,
         }
 
     def _handle(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._management_lock:
+            return self._handle_locked(payload)
+
+    def _active_leases(self) -> dict:
+        self._leases = {key: lease for key, lease in self._leases.items()
+                        if process_matches(lease["pid"], lease["process_token"])}
+        return self._leases
+
+    def _touch(self) -> None:
+        self.last_used_at, self._last_use = time.time(), time.monotonic()
+
+    def _handle_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
         command = payload.get("command")
+        if self._stop and command not in ("ping", "status", "lease-release"):
+            raise RuntimeError("daemon is stopping; retry after it exits")
         if command == "ping":
             return {"ok": True, "pong": True}
         if command == "status":
@@ -191,7 +218,32 @@ class WeightLoaderDaemon:
         if command == "manifest":
             assert self.cached is not None
             return {"ok": True, "manifest": self.cached.to_manifest(self.view)}
-        if command == "stop":
+        if command == "touch":
+            self._touch()
+            self.reuse_requests += 1
+            return {"ok": True}
+        if command in ("lease-acquire", "lease-update"):
+            pid, token = int(payload["pid"]), payload.get("process_token")
+            if not process_matches(pid, token):
+                raise RuntimeError("lease owner is not a live process")
+            if len(self._active_leases()) >= 4096:
+                raise RuntimeError("too many active leases")
+            key = payload.get("lease") if command == "lease-update" else uuid.uuid4().hex
+            if command == "lease-update" and key not in self._leases:
+                raise RuntimeError("unknown lease")
+            self._leases[key] = dict(pid=pid, process_token=token)
+            self._touch()
+            self.reuse_requests += command == "lease-acquire"
+            return {"ok": True, "lease": key, "view": str(self.view)}
+        if command == "lease-release":
+            self._leases.pop(payload.get("lease"), None)
+            self._touch()
+            return {"ok": True}
+        if command in ("stop", "evict"):
+            if self._active_leases() and not payload.get("force", False):
+                raise RuntimeError("cache has active leases; wait or use stop --force")
+            if command == "evict" and self.last_used_at != payload.get("last_used_at"):
+                raise RuntimeError("cache was used after collection was planned")
             self._remove_view_on_exit = bool(payload.get("remove_view", False))
             self._stop = True
             return {"ok": True, "stopping": True}
@@ -294,7 +346,6 @@ class WeightLoaderDaemon:
                 else:
                     raise RuntimeError(f"runtime socket still has a listener: {self.socket_path}")
 
-
     def _install_signal_handlers(self) -> None:
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -351,6 +402,7 @@ class WeightLoaderDaemon:
         try:
             self.load()
             self._reservation.ready()
+            self._touch()
             if source_identity(self.upstream_source or self.source, self.include_patterns, self.exclude_patterns) != self.identity:
                 raise RuntimeError("source model changed during startup; stop and retry")
 
@@ -367,6 +419,10 @@ class WeightLoaderDaemon:
             self.log(f"[listen] socket={self.socket_path}")
 
             while not self._stop:
+                with self._management_lock:
+                    if self.idle_ttl is not None and not self._active_leases() and time.monotonic() - self._last_use >= self.idle_ttl:
+                        self._stop, self._remove_view_on_exit = True, True
+                        break
                 try:
                     conn, _ = server.accept()
                 except socket.timeout:
