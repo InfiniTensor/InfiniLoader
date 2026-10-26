@@ -312,6 +312,11 @@ def garbage_collect(*, cache_root=None, base_dir=None, max_bytes=None, ttl=None,
                 with FileLock(lease_path(path), timeout=0):
                     if path.is_symlink() or path.parent != root or not read_json(_manifest_path(path)):
                         raise RuntimeError("cache ownership changed during collection")
+                    usage = read_json(root / ".usage" / f"{path.name}.json") or {}
+                    last_used = usage.get("last_used_at", _created_at(path))
+                    if last_used != row["last_used_at"]:
+                        skipped.append(dict(cache_path=str(path), reason="used since collection scan"))
+                        continue
                     if apply:
                         shutil.rmtree(path)
                         (root / ".usage" / f"{path.name}.json").unlink(missing_ok=True)

@@ -9,6 +9,7 @@ from conftest import make_model_dir
 from infiniloader.cli import main
 from infiniloader.local_cache import garbage_collect, lease_path, materialize_model_cache, verify_cache
 from infiniloader.runtime import FileLock, atomic_json
+from infiniloader import local_cache
 from test_lifecycle import running_daemon
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="POSIX file locks")
@@ -59,6 +60,47 @@ def test_gc_dry_run_lru_and_active_leases(tmp_path):
         assert first.cache_path.exists()
         assert not second.cache_path.exists()
     assert garbage_collect(cache_root=root, ttl=0, apply=True)["remaining_bytes"] == 0
+
+
+@pytest.mark.parametrize("policy", ["ttl", "budget"])
+def test_gc_rechecks_usage_after_scanning(tmp_path, monkeypatch, policy):
+    root = tmp_path / "cache"
+    first = materialize_model_cache(make_model_dir(tmp_path / "a"), cache_root=root)
+    second = materialize_model_cache(make_model_dir(tmp_path / "b"), cache_root=root)
+    for index, cache in enumerate((first, second)):
+        atomic_json(root / ".usage" / f"{cache.cache_path.name}.json", {"last_used_at": index + 1})
+    scan = local_cache.list_model_caches
+
+    def scan_then_use(**kwargs):
+        rows = scan(**kwargs)
+        with FileLock(lease_path(first.cache_path), shared=True):
+            local_cache.touch_cache(first.cache_path)
+        return rows
+
+    monkeypatch.setattr(local_cache, "list_model_caches", scan_then_use)
+    options = {"ttl": 3600} if policy == "ttl" else {"max_bytes": first.total_bytes}
+    result = garbage_collect(cache_root=root, apply=True, **options)
+    assert first.cache_path.exists()
+    assert not second.cache_path.exists()
+    assert result["remaining_bytes"] == first.total_bytes
+    assert result["skipped"] == [{"cache_path": str(first.cache_path), "reason": "used since collection scan"}]
+    assert result["budget_met"]
+
+
+def test_gc_reports_unmet_budget_when_only_candidate_was_used(tmp_path, monkeypatch):
+    root = tmp_path / "cache"
+    cache = materialize_model_cache(make_model_dir(tmp_path / "model"), cache_root=root)
+    scan = local_cache.list_model_caches
+
+    def scan_then_use(**kwargs):
+        rows = scan(**kwargs)
+        local_cache.touch_cache(cache.cache_path)
+        return rows
+
+    monkeypatch.setattr(local_cache, "list_model_caches", scan_then_use)
+    result = garbage_collect(cache_root=root, max_bytes=0, apply=True)
+    assert cache.cache_path.exists()
+    assert not result["budget_met"]
 
 
 def test_daemon_pins_local_disk_generation(tmp_path):
