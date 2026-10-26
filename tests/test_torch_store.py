@@ -74,6 +74,29 @@ def test_sharded_store_enforces_exported_contract(tmp_path):
             store.rank_tensors(rules, 0)
 
 
+def test_planner_and_canonical_store_reject_empty_pipeline_stages(tmp_path):
+    source = tmp_path / "source"
+    write_tensor(source)
+    rules = layout(0)
+    rules["pp"] = 2
+    with resident(source, tmp_path / "view") as view, TensorStore(view) as store:
+        for mode in ("sharded", "replicated"):
+            with pytest.raises(ValueError, match="every pipeline stage"):
+                build_plan(source, rules, mode=mode)
+        for rank in range(4):
+            with pytest.raises(ValueError, match="every pipeline stage"):
+                store.rank_tensors(rules, rank)
+
+
+def test_empty_tensor_is_a_valid_pipeline_stage_assignment(tmp_path):
+    source = tmp_path / "source"
+    write_tensor(source, shape=(0, 2))
+    rules = layout(0)
+    assert build_plan(source, rules)["ranks"][0]["tensor_bytes"] == 0
+    with resident(source, tmp_path / "view") as view, TensorStore(view) as store:
+        assert store.rank_tensors(rules, 0)["weight"].shape == (0, 2)
+
+
 def test_scalar_and_empty_cpu_view(tmp_path):
     scalar, empty = tmp_path / "scalar", tmp_path / "empty"
     write_tensor(scalar, shape=())

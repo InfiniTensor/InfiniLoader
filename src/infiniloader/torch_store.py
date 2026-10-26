@@ -11,6 +11,7 @@ import hashlib
 from pathlib import Path
 
 from .shards import catalog, verify_rank, read_json
+from .layouts import validate_layout
 
 
 class TensorStore:
@@ -75,28 +76,19 @@ class TensorStore:
         """
         if self._closed:
             raise RuntimeError("tensor store is closed")
-        tp, pp, rules = layout.get("tp"), layout.get("pp"), layout.get("tensors")
-        if (layout.get("format") != 1 or type(tp) is not int or tp < 1
-                or type(pp) is not int or pp < 1 or type(rank) is not int or not 0 <= rank < tp * pp
-                or not isinstance(rules, dict)):
+        if type(rank) is not int:
             raise ValueError("invalid tensor layout/rank")
         if self.receipt and self.receipt["plan"]["mode"] == "sharded":
             if layout != self.receipt["plan"]["layout"] or rank != self.receipt["rank"]:
                 raise ValueError("sharded store requires its exported layout and rank")
             return {n: self.tensor(n) for n in self.catalog["tensors"]}
-        if set(rules) != set(self.catalog["tensors"]):
-            raise ValueError("layout must cover exactly all canonical tensors")
+        tp, pp, rules = validate_layout(self.catalog["tensors"], layout)
+        if not 0 <= rank < tp * pp:
+            raise ValueError("invalid tensor layout/rank")
         result = {}
         for name, spec in self.catalog["tensors"].items():
             rule = rules[name]
-            if not isinstance(rule, dict) or set(rule) != {"stage", "split_dim"}:
-                raise ValueError(f"invalid tensor rule: {name}")
             stage, dim = rule["stage"], rule["split_dim"]
-            if type(stage) is not int or not 0 <= stage < pp:
-                raise ValueError(f"invalid stage: {name}")
-            if dim is not None and (type(dim) is not int or not 0 <= dim < len(spec["shape"])
-                                    or spec["shape"][dim] % tp):
-                raise ValueError(f"invalid split: {name}")
             if stage != rank // tp:
                 continue
             tensor = self.tensor(name)

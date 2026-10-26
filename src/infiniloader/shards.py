@@ -18,6 +18,7 @@ import tempfile
 from pathlib import Path
 
 from .formats import DTYPE_BYTES, MAX_HEADER, _signature, canonical, read_json, tensor_header, tensor_inventory
+from .layouts import validate_layout
 
 CHUNK = 1024 * 1024
 
@@ -65,23 +66,9 @@ def catalog(source: Path) -> dict:
 
 def build_plan(source: Path, layout: dict, *, mode="sharded", capacities: list[int] | None = None) -> dict:
     cat = catalog(source)
-    if not isinstance(layout, dict) or layout.get("format") != 1:
-        raise ValueError("layout requires format=1")
-    tp, pp = layout.get("tp"), layout.get("pp")
-    rules = layout.get("tensors")
-    if not _int(tp, minimum=1) or not _int(pp, minimum=1) or not isinstance(rules, dict):
-        raise ValueError("layout requires positive tp, pp and explicit tensor rules")
-    if mode not in ("sharded", "replicated") or set(rules) != set(cat["tensors"]):
-        raise ValueError("invalid mode or layout must explicitly cover exactly all tensors")
-    for name, spec in cat["tensors"].items():
-        rule = rules[name]
-        if not isinstance(rule, dict) or set(rule) != {"stage", "split_dim"}:
-            raise ValueError(f"rule requires stage and split_dim: {name}")
-        stage, dim = rule["stage"], rule["split_dim"]
-        if not _int(stage) or stage >= pp:
-            raise ValueError(f"invalid pipeline stage: {name}")
-        if dim is not None and (not _int(dim) or dim >= len(spec["shape"]) or spec["shape"][dim] % tp):
-            raise ValueError(f"invalid or nondivisible split dimension: {name}")
+    tp, pp, rules = validate_layout(cat["tensors"], layout)
+    if mode not in ("sharded", "replicated"):
+        raise ValueError("invalid shard mode")
     ranks = []
     for rank in range(tp * pp):
         stage, lane = divmod(rank, tp)
@@ -100,8 +87,6 @@ def build_plan(source: Path, layout: dict, *, mode="sharded", capacities: list[i
                            "bytes": math.prod(shape) * DTYPE_BYTES[spec["dtype"]]}
         ranks.append({"rank": rank, "stage": stage, "lane": lane, "tensors": parts,
                       "tensor_bytes": sum(p["bytes"] for p in parts.values())})
-    if any(not r["tensors"] for r in ranks):
-        raise ValueError("every pipeline stage must own at least one tensor")
     if capacities is not None:
         if len(capacities) != len(ranks) or not all(_int(v) for v in capacities):
             raise ValueError("capacities requires one nonnegative byte limit per rank")
