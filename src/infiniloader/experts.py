@@ -19,7 +19,7 @@ class _Entry:
     weights: dict
     nbytes: int
     users: int = 0
-    events: list = field(default_factory=list)
+    events: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -74,7 +74,7 @@ class ExpertPool:
         entry = self.entries[expert]
         if entry.users:
             raise RuntimeError("expert is leased")
-        for event in entry.events:
+        for event in entry.events.values():
             event.synchronize()
         del self.entries[expert]
         self._stats["evictions"] += 1
@@ -150,11 +150,11 @@ class ExpertPool:
                         for consumer_stream in lease._streams:
                             event = self.torch.cuda.Event()
                             event.record(consumer_stream)
-                            entry.events.append(event)
+                            # Later work on this stream covers earlier leases.
+                            # Retain the stream key as well as its latest event.
+                            entry.events[consumer_stream] = event
                             for tensor in entry.weights.values():
                                 tensor.record_stream(consumer_stream)
-                        # Completed events do not need to accumulate over hot hits.
-                        entry.events[:] = [e for e in entry.events if not e.query()]
                     except BaseException:
                         self.torch.cuda.synchronize(self.device)
                         raise
