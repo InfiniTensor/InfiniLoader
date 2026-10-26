@@ -15,6 +15,7 @@ from typing import Any
 
 from .cache import CachedModel, build_view, human_bytes, load_model_into_memory, source_identity, _safe_remove_view
 from .runtime import FileLock, atomic_json, atomic_text, process_matches, read_json, process_token
+from .local_cache import lease_path, verify_cache
 
 
 class WeightLoaderDaemon:
@@ -299,6 +300,10 @@ class WeightLoaderDaemon:
             for path in (self.pid_path, self.state_path):
                 locks.enter_context(FileLock(path.with_name(f".{path.name}.owner.lock"), timeout=0))
             self._check_runtime_paths()
+            if self.local_cache_path:
+                locks.enter_context(FileLock(lease_path(self.local_cache_path), shared=True))
+                if not verify_cache(self.local_cache_path, full=False)["valid"]:
+                    raise RuntimeError("local cache changed or was removed before daemon startup")
             self._owns_runtime = True
             try:
                 return self._serve_owned()

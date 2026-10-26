@@ -28,7 +28,7 @@ def wait_for(check, timeout=8):
 
 
 @contextmanager
-def running_daemon(tmp_path, model, *, slow=False):
+def running_daemon(tmp_path, model, *, slow=False, extra=()):
     state = tmp_path / "state"
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
     code = (
@@ -40,6 +40,7 @@ def running_daemon(tmp_path, model, *, slow=False):
     )
     command = [sys.executable, "-c", code] if slow else [sys.executable, "-m", "infiniloader"]
     command += ["_serve", str(model), "--name", "unit", "--base-dir", str(state), "--replace", "--quiet"]
+    command += list(extra)
     with (tmp_path / "daemon.log").open("w+") as log:
         proc = subprocess.Popen(command, env=env, stdout=log, stderr=log)
         try:
