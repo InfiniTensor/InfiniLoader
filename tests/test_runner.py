@@ -1,5 +1,7 @@
 import os
+import json
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -71,3 +73,57 @@ def test_signal_handlers_are_restored_when_spawn_fails(tmp_path):
     with pytest.raises(FileNotFoundError):
         run_program([str(tmp_path / "missing-command")], tmp_path)
     assert {s: signal.getsignal(s) for s in before} == before
+
+
+@pytest.mark.parametrize("signum", [signal.SIGHUP, signal.SIGTERM])
+def test_wrapper_and_child_preserve_inherited_ignored_signals(tmp_path, signum):
+    if signum == signal.SIGHUP and not shutil.which("nohup"):
+        pytest.skip("requires nohup")
+    cache = materialize_model_cache(make_model_dir(tmp_path / "model"), base_dir=tmp_path / "state")
+    marker, finish = tmp_path / "consumer.json", tmp_path / "finish"
+    code = (
+        "import json,os,pathlib,signal,sys,time\n"
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps({'pid':os.getpid(),"
+        f"'ignored':signal.getsignal({int(signum)}) == signal.SIG_IGN}}))\n"
+        "while not pathlib.Path(sys.argv[2]).exists(): time.sleep(.02)\n"
+    )
+    command = [sys.executable, "-m", "infiniloader", "run", "--cache-path", str(cache.cache_path),
+               "--", sys.executable, "-c", code, str(marker), str(finish)]
+    if signum == signal.SIGHUP:
+        command = ["nohup", *command]
+    else:
+        command = [sys.executable, "-c",
+                   "import os,signal,sys; signal.signal(signal.SIGTERM,signal.SIG_IGN); os.execv(sys.argv[1],sys.argv[1:])",
+                   *command]
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+    child, token = None, None
+    with (tmp_path / "wrapper.log").open("w") as log:
+        wrapper = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+        try:
+            def started():
+                assert wrapper.poll() is None, (tmp_path / "wrapper.log").read_text()
+                return marker.exists() and marker.read_text()
+            wait_for(started, timeout=20)
+            data = json.loads(marker.read_text())
+            child, token = data["pid"], process_token(data["pid"])
+            assert data["ignored"]
+            status = Path(f"/proc/{wrapper.pid}/status").read_text()
+            mask = int(next(line.split()[1] for line in status.splitlines() if line.startswith("SigIgn:")), 16)
+            assert mask & (1 << (signum - 1))
+            wrapper.send_signal(signum)
+            os.kill(child, signum)
+            assert process_matches(child, token)
+            assert not garbage_collect(base_dir=tmp_path / "state", max_bytes=0, apply=True)["budget_met"]
+            finish.touch()
+            assert wrapper.wait(timeout=8) == 0
+            assert garbage_collect(base_dir=tmp_path / "state", max_bytes=0, apply=True)["budget_met"]
+        finally:
+            finish.touch()
+            if wrapper.poll() is None:
+                try:
+                    wrapper.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    wrapper.kill()
+                    wrapper.wait(timeout=3)
+            if child is not None:
+                wait_for(lambda: not process_matches(child, token))

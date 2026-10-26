@@ -24,6 +24,8 @@ def run_program(program, path, *, pass_fds=(), socket_path=None, lease=None) -> 
         # SIGINT retains Python's KeyboardInterrupt handling: terminal interrupts
         # already reach both processes in the foreground process group.
         for signum in (signal.SIGTERM, signal.SIGHUP):
+            if signal.getsignal(signum) == signal.SIG_IGN:
+                continue
             handlers[signum] = signal.signal(signum, cancel)
         env = dict(os.environ, ILOADER_MODEL_PATH=str(path))
         proc = subprocess.Popen([part.replace("{model}", str(path)) for part in program],
