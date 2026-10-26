@@ -40,6 +40,14 @@ def test_run_substitutes_model_path_and_releases_lease(tmp_path):
         assert request(state / "run/unit.sock", {"command": "status"})["status"]["active_leases"] == 0
 
 
+def test_run_uses_the_explicit_start_socket(tmp_path):
+    socket = tmp_path / "custom.sock"
+    with running_daemon(tmp_path, make_model_dir(tmp_path / "model"), extra=["--socket", str(socket)]) as (_, state):
+        assert main(["run", "--base-dir", str(state), "--socket", str(socket), "unit", "--",
+                     sys.executable, "-c", "import os,pathlib; assert pathlib.Path(os.environ['ILOADER_MODEL_PATH']).is_dir()"]) == 0
+        assert request(socket, {"command": "status"})["status"]["active_leases"] == 0
+
+
 def test_run_disk_cache_preserves_command_exit_code(tmp_path):
     local = materialize_model_cache(make_model_dir(tmp_path / "model"), base_dir=tmp_path / "state")
     assert main(["run", "--cache-path", str(local.cache_path), "--", sys.executable, "-c", "raise SystemExit(7)"]) == 7

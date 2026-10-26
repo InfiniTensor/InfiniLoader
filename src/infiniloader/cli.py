@@ -15,6 +15,7 @@ from .completion import bash_completion
 from .benchmark import benchmark_path
 from .cache import DEFAULT_EXCLUDES, build_view, human_bytes, inspect_source, load_model_into_memory, source_identity, _safe_remove_view
 from .runtime import FileLock, process_matches, process_token, read_json, signal_owned_process, validate_name, validate_socket_path
+from .runner import run_program as _run_program
 from .daemon import WeightLoaderDaemon
 from .distributed import build_tp_plan, create_rank_views, simulate_distributed_read
 from .ipc import LoaderConnectionError, LoaderStoppingError, request
@@ -739,31 +740,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             request(sock, {"command": "lease-release", "lease": lease["lease"]})
         except (LoaderConnectionError, RuntimeError):
             pass
-
-
-def _run_program(program, path, *, pass_fds=(), socket_path=None, lease=None) -> int:
-    env = dict(os.environ, ILOADER_MODEL_PATH=str(path))
-    proc = subprocess.Popen([part.replace("{model}", str(path)) for part in program], env=env, pass_fds=pass_fds)
-    try:
-        if lease:
-            token = process_token(proc.pid)
-            if proc.poll() is None:
-                try:
-                    request(socket_path, {"command": "lease-update", "lease": lease, "pid": proc.pid,
-                                          "process_token": token})
-                except RuntimeError:
-                    if proc.poll() is None:
-                        raise
-        return proc.wait()
-    except BaseException:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-        raise
 
 
 def cmd_completion(args: argparse.Namespace) -> int:

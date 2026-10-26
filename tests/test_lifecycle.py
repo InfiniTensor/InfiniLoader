@@ -50,7 +50,8 @@ def running_daemon(tmp_path, model, *, slow=False, extra=()):
                 return (state / "run/unit.state.json").exists()
             wait_for(registered, timeout=15)
             if not slow:
-                wait_for(lambda: (state / "run/unit.sock").exists())
+                socket = Path(extra[extra.index("--socket") + 1]) if "--socket" in extra else state / "run/unit.sock"
+                wait_for(lambda: socket.exists())
             yield proc, state
         finally:
             if proc.poll() is None:

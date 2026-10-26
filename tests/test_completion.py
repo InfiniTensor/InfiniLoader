@@ -39,6 +39,8 @@ def test_nested_options_match_the_parser():
     assert {"--layout", "--output", "--mode", "--help"} <= options
     assert "--rank" not in options
     assert "--idle-ttl" in complete(["iloader", "start", "--"])
+    assert "--socket" in complete(["iloader", "run", "--socket", "/tmp/custom.sock", "--"])
+    assert "--socket" in complete(["iloader", "run", "--socket=/tmp/custom.sock", "--"])
 
 
 @pytest.mark.skipif(os.name != "posix" or not shutil.which("bash"), reason="Bash completion integration")

@@ -46,9 +46,9 @@ def bash_completion(parser: argparse.ArgumentParser) -> str:
       if (( run_skip )); then run_skip=0; continue; fi
       case "$word" in
         --) return 0 ;;
-        --base-dir) run_skip=1 ;;
+        --base-dir|--socket) run_skip=1 ;;
         --cache-path) run_cache=1; run_skip=1 ;;
-        --base-dir=*) ;;
+        --base-dir=*|--socket=*) ;;
         --cache-path=*) run_cache=1 ;;
         -*) ;;
         *) run_name=1 ;;

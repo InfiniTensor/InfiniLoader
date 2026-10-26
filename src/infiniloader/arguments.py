@@ -135,7 +135,9 @@ def build_parser(handlers: Mapping[str, CommandHandler]) -> argparse.ArgumentPar
 
     run_p = sub.add_parser("run", help="run a foreground command while protecting its cache from eviction")
     run_p.add_argument("--base-dir")
-    run_p.add_argument("--cache-path")
+    run_location = run_p.add_mutually_exclusive_group()
+    run_location.add_argument("--cache-path")
+    run_location.add_argument("--socket", help="socket of the resident cache; use the same override as start")
     run_p.add_argument("name_arg", nargs="?")
     run_p.add_argument("program", nargs=argparse.REMAINDER)
     run_p.set_defaults(func=handlers["cmd_run"])

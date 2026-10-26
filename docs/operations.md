@@ -18,6 +18,18 @@ iloader run dev -- vllm serve '{model}' --tensor-parallel-size 4
 exit code. Put InfiniLoader options before the cache name. Use a foreground engine
 command that remains alive while its workers run.
 
+For a daemon started with `--socket PATH`, pass the same override before the name:
+`iloader run --socket PATH dev -- COMMAND '{model}'`. This option and `--cache-path`
+are mutually exclusive.
+
+`run` forwards SIGTERM and SIGHUP to its direct child, waits for it to exit, and
+kills it after a three-second cancellation grace period. SIGINT uses normal
+foreground terminal handling. A signal-terminated child returns `128 + signal`
+(for example 143 for SIGTERM); ordinary exit codes are unchanged. The lease lasts
+until the child is reaped. Backgrounded descendants are outside this contract.
+If the wrapper is killed by an uncatchable signal, a surviving direct child
+continues to hold its lease.
+
 For disk-only caching without another model-sized RAM allocation:
 
 ```bash
