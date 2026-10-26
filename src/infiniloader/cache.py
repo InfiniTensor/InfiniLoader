@@ -8,6 +8,7 @@ import shutil
 import stat
 import time
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -287,7 +288,7 @@ def copy_file_to_memfd(source: SourceFile, chunk_size: int = 64 * 1024 * 1024) -
                     fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
         os.fchmod(dst_fd, 0o400)
         return CachedFile(source=source, fd=dst_fd, digest_prefix=digest.hexdigest()[:16])
-    except Exception:
+    except BaseException:
         try:
             if dst_fd is not None:
                 os.close(dst_fd)
@@ -325,25 +326,31 @@ def load_model_into_memory(
 
     copied = 0
     cached_by_index: list[CachedFile | None] = [None] * len(source_files)
-    futures = {}
+    ownership = threading.Lock()
+    aborted = False
+
+    def load_one(index: int) -> CachedFile:
+        item = copy_file_to_memfd(source_files[index], chunk_size=chunk_size)
+        with ownership:
+            if aborted:
+                item.close()
+            else:
+                cached_by_index[index] = item
+        return item
+
     try:
         if workers <= 1:
             for index, item in enumerate(source_files):
-                cached_item = copy_file_to_memfd(item, chunk_size=chunk_size)
-                cached_by_index[index] = cached_item
+                load_one(index)
                 copied += item.size
                 if progress:
                     progress(copied, total, item.rel)
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(copy_file_to_memfd, item, chunk_size): (index, item)
-                    for index, item in enumerate(source_files)
-                }
+                futures = [pool.submit(load_one, index) for index in range(len(source_files))]
                 for future in as_completed(futures):
-                    index, item = futures[future]
                     cached_item = future.result()
-                    cached_by_index[index] = cached_item
+                    item = cached_item.source
                     copied += item.size
                     if progress:
                         progress(copied, total, item.rel)
@@ -358,23 +365,14 @@ def load_model_into_memory(
             exclude_patterns=exclude_patterns,
             workers=max(1, workers),
         )
-    except Exception:
-        closed_fds = set()
-        for item in cached_by_index:
-            if item is None:
-                continue
-            item.close()
-            closed_fds.add(item.fd)
-        for future in futures:
-            if not future.done() or future.cancelled():
-                continue
-            try:
-                item = future.result()
-            except Exception:
-                continue
-            if item.fd not in closed_fds:
-                item.close()
-                closed_fds.add(item.fd)
+    except BaseException:
+        # A second interrupt can also break the executor's shutdown wait. Workers
+        # finishing afterwards must release their own files instead of publishing.
+        with ownership:
+            aborted = True
+            for item in cached_by_index:
+                if item is not None:
+                    item.close()
         raise
 
 
