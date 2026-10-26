@@ -89,6 +89,10 @@ iloader start "$MODEL" --name dev --workers 4 \
   directory. A subsequent start can explicitly update the cap. In-flight loads reserve
   model and buffer bytes; ready caches reserve model bytes. Dead reservations are
   pruned using boot ID and PID start time.
+- Concurrent admissions deduct the outstanding part of pending reservations from
+  current headroom. Completed sealed files are already reflected in headroom and
+  are not deducted again. Incomplete files and worker buffers remain conservatively
+  reserved until completion; quotas are admission estimates, not a physical RAM guarantee.
 - `--force` bypasses the available-memory check, while explicit per-cache and shared
   caps remain enforced. Quotas account for InfiniLoader, not engine allocations.
 - Byte options accept integers and binary suffixes such as `256MiB` and `32GiB`.

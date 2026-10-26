@@ -110,6 +110,8 @@ class WeightLoaderDaemon:
         self._claim_runtime_file(self.state_path)
 
     def _progress(self, copied: int, total: int, rel: Path) -> None:
+        if self._reservation is not None:
+            self._reservation.materialized(copied)
         pct = copied / total * 100 if total else 100.0
         elapsed = time.time() - self.load_started_at if self.load_started_at else 0.0
         rate = copied / elapsed if elapsed > 0 and copied > 0 else None

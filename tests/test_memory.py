@@ -63,6 +63,65 @@ def test_reservations_enforce_shared_quota_and_remove_stale_pids(tmp_path, monke
     assert not json.loads((tmp_path / "resident.json").read_text())["entries"]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file locks")
+@pytest.mark.parametrize("completed,ready,available,required,allowed", [
+    (0, False, 100, 40, False),
+    (45, False, 55, 20, True),
+    (55, False, 45, 20, True),
+    (55, True, 45, 20, True),
+])
+def test_pending_budget_deducts_only_outstanding_commitments(tmp_path, monkeypatch, completed, ready, available, required, allowed):
+    headroom = [100]
+    monkeypatch.setattr(memory, "memory_info", lambda: dict(available_bytes=headroom[0]))
+    with ResidentReservation(tmp_path, "a", 55, 5, reserve_bytes=0) as a:
+        a.materialized(completed)
+        if ready:
+            a.ready()
+        headroom[0] = available
+        if allowed:
+            with ResidentReservation(tmp_path, "b", required, 0, reserve_bytes=0) as b:
+                assert b.info["pending_bytes"] == (0 if ready else 60 - completed)
+        else:
+            with pytest.raises(MemoryError, match="effective budget"):
+                with ResidentReservation(tmp_path, "b", required, 0, reserve_bytes=0):
+                    pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file locks")
+def test_progress_does_not_discount_quota_and_rejects_invalid_credit(tmp_path, monkeypatch):
+    monkeypatch.setattr(memory, "memory_info", lambda: dict(available_bytes=10000))
+    with ResidentReservation(tmp_path, "a", 55, 5, max_resident_bytes=70, reserve_bytes=0) as a:
+        a.materialized(45)
+        for invalid in (44, 56, True):
+            with pytest.raises(ValueError, match="progress"):
+                a.materialized(invalid)
+        with pytest.raises(MemoryError, match="quota"):
+            with ResidentReservation(tmp_path, "b", 11, 0, reserve_bytes=0):
+                pass
+        a.ready()
+        with ResidentReservation(tmp_path, "b", 15, 0, reserve_bytes=0):
+            pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file locks")
+@pytest.mark.parametrize("credit", [None, 1000, -1, True])
+def test_missing_or_invalid_progress_retains_full_pending_reservation(tmp_path, monkeypatch, credit):
+    headroom = [100]
+    monkeypatch.setattr(memory, "memory_info", lambda: dict(available_bytes=headroom[0]))
+    with ResidentReservation(tmp_path, "a", 55, 5, reserve_bytes=0) as a:
+        path = tmp_path / "resident.json"
+        data = json.loads(path.read_text())
+        if credit is None:
+            data["entries"][a.key].pop("materialized_bytes")
+        else:
+            data["entries"][a.key]["materialized_bytes"] = credit
+        atomic_json(path, data)
+        headroom[0] = 55
+        with pytest.raises(MemoryError, match="effective budget"):
+            with ResidentReservation(tmp_path, "b", 20, 0, reserve_bytes=0):
+                pass
+
+
 @pytest.mark.parametrize("value, expected", [("0", 0), ("2GiB", 2 * 1024**3), ("256M", 256 * 1024**2)])
 def test_human_readable_sizes(value, expected):
     assert parse_bytes(value) == expected

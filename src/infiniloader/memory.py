@@ -112,14 +112,32 @@ class ResidentReservation:
             required = self.total + self.buffers
             if cap is not None and reserved + required > cap:
                 raise MemoryError(f"resident quota exceeded: {reserved} reserved + {required} requested > {cap}")
-            pending = sum(row["reserved_bytes"] for row in data["entries"].values() if row["pending"])
+            pending = 0
+            for row in data["entries"].values():
+                if row["pending"]:
+                    credit = row.get("materialized_bytes", 0)
+                    if type(credit) is not int or not 0 <= credit <= row["model_bytes"]:
+                        credit = 0
+                    pending += row["reserved_bytes"] - credit
             self.info = check_memory(required, pending_bytes=pending, **self.options)
             self.info["max_resident_bytes"] = cap
             data["max_resident_bytes"] = cap
             data["entries"][self.key] = dict(name=self.name, pid=self.pid, process_token=self.token,
-                                             model_bytes=self.total, reserved_bytes=required, pending=True)
+                                             model_bytes=self.total, reserved_bytes=required,
+                                             materialized_bytes=0, pending=True)
             atomic_json(self.run_dir / "resident.json", data)
         return self
+
+    def materialized(self, copied_bytes: int):
+        """Credit only complete, sealed files still owned by this loader."""
+        with FileLock(self.run_dir / "resident.lock"):
+            data = self._read()
+            row = data["entries"][self.key]
+            if (type(copied_bytes) is not int or not row["pending"]
+                    or not row.get("materialized_bytes", 0) <= copied_bytes <= self.total):
+                raise ValueError("invalid materialized preload progress")
+            row["materialized_bytes"] = copied_bytes
+            atomic_json(self.run_dir / "resident.json", data)
 
     def ready(self):
         with FileLock(self.run_dir / "resident.lock"):
