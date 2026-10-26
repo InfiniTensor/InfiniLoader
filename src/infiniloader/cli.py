@@ -979,6 +979,8 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_p.add_argument("--exclude", action="append", help="exclude glob; replaces defaults when provided")
     inspect_p.add_argument("--json", action="store_true")
     inspect_p.set_defaults(func=cmd_inspect)
+    from .shards import configure_parser as configure_shards
+    configure_shards(sub)
 
     serve_p = sub.add_parser("_serve", help=argparse.SUPPRESS)
     serve_p.add_argument("model")
