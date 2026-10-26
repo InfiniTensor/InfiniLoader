@@ -36,7 +36,13 @@ that these engines consume the new InfiniLoader shard format directly.
 
 The legacy `dist-plan` remains a heuristic report. It shares strict format and
 index validation with `shard`, while reading headers rather than hashing payloads. The new executable path requires
-an exact tensor inventory and explicit TP dimension/PP stage for **every** tensor:
+an exact tensor inventory and explicit TP dimension/PP stage for **every** tensor.
+
+Planning and canonical runtime slicing use the same layout validator. Every PP
+stage must own at least one tensor, in both export modes; an empty tensor still
+counts as an assignment. Replication changes storage placement, not layout validity.
+
+For example:
 
 ```json
 {
@@ -137,6 +143,10 @@ weights default to the current consumer stream; use `acquire(..., stream=stream)
 and `lease.record_stream(other_stream)` for every additional consumer stream.
 Before eviction, the pool waits for recorded work and protects allocator reuse.
 Active leases cannot be evicted. Failed uploads never publish half an expert.
+The pool retains only the latest completion event for each distinct consumer
+stream per expert, until eviction; it does not scan a history of hot leases.
+CPU event-model tests cover this bookkeeping. GPU ordering still requires the
+separate real-device tests and is not established by the CPU test model.
 
 The budget counts pool-owned weight payload, including admission in progress; it
 does not cap activations, external tensor references, CUDA context or allocator

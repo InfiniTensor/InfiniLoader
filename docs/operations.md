@@ -27,8 +27,9 @@ kills it after a three-second cancellation grace period. SIGINT uses normal
 foreground terminal handling. A signal-terminated child returns `128 + signal`
 (for example 143 for SIGTERM); ordinary exit codes are unchanged. The lease lasts
 until the child is reaped. Backgrounded descendants are outside this contract.
-If the wrapper is killed by an uncatchable signal, a surviving direct child
-continues to hold its lease.
+After the child has inherited the disk lease or received the resident lease,
+it remains protected if the wrapper is killed by an uncatchable signal. There is
+a short spawn-to-transfer window for resident leases where this cannot be guaranteed.
 
 For disk-only caching without another model-sized RAM allocation:
 
