@@ -121,8 +121,10 @@ Shutdown removes verified PID and socket resources before deleting their state.
 An uncertain deletion or changed ownership retains the state and emits a cleanup
 diagnostic, including in quiet mode. On the next start, unchanged owned stale
 resources can be reclaimed; unrelated replacements are preserved for inspection.
-If a recorded private socket cannot be verified or removed during recovery,
-startup fails before replacing the old state, so a retry retains the same evidence.
+Successfully removed private names are unregistered. If a released name is reused
+by another inode, recovery leaves it untouched only after independently verifying
+the old public socket as owned and stale. Uncertain lookup or removal errors still
+stop recovery before replacing the old state, preserving evidence for a retry.
 
 `run` protects a cache against ordinary stop and eviction. Local-cache daemons also
 hold a disk-generation lease. Foreground disk commands inherit its OS lock descriptor;

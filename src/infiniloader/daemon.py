@@ -392,19 +392,23 @@ class WeightLoaderDaemon:
                     st = None
                 if st is not None:
                     expected = {"device": st.st_dev, "inode": st.st_ino}
-                    if (not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid()
-                            or expected != state.get("runtime_socket")):
-                        raise RuntimeError(f"private socket has no matching owned state: {path}")
-                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-                        probe.settimeout(.2)
-                        try:
-                            probe.connect(str(path))
-                        except ConnectionRefusedError:
-                            self._remove_stale_file(path, st)
-                        except OSError as exc:
-                            raise RuntimeError(f"cannot establish that private socket is stale: {path}") from exc
-                        else:
-                            raise RuntimeError(f"private socket still has a listener: {path}")
+                    # A verified stale public link proves publication completed.
+                    # Another inode at the released private name is not ours.
+                    reused = stale_socket is not None and expected != state.get("runtime_socket")
+                    if not reused:
+                        if (not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid()
+                                or expected != state.get("runtime_socket")):
+                            raise RuntimeError(f"private socket has no matching owned state: {path}")
+                        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                            probe.settimeout(.2)
+                            try:
+                                probe.connect(str(path))
+                            except ConnectionRefusedError:
+                                self._remove_stale_file(path, st)
+                            except OSError as exc:
+                                raise RuntimeError(f"cannot establish that private socket is stale: {path}") from exc
+                            else:
+                                raise RuntimeError(f"private socket still has a listener: {path}")
         if stale_pid is not None:
             self._remove_stale_file(self.pid_path, stale_pid)
         if stale_socket is not None:
@@ -448,6 +452,8 @@ class WeightLoaderDaemon:
         self._claimed_runtime[self.socket_path] = (st.st_dev, st.st_ino)
         os.link(private, self.socket_path, follow_symlinks=False)
         private.unlink()
+        self._claimed_runtime.pop(private)
+        self._private_socket = None
 
     def _install_signal_handlers(self) -> None:
         signal.signal(signal.SIGTERM, self._handle_signal)
