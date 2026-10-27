@@ -17,8 +17,22 @@ from test_lifecycle import wait_for
 pytestmark = pytest.mark.skipif(not hasattr(os, "memfd_create"), reason="Linux process and lease tests")
 
 
+@pytest.fixture
+def default_signals():
+    handlers = {signal.SIGTERM: signal.SIG_DFL, signal.SIGHUP: signal.SIG_DFL,
+                signal.SIGINT: signal.default_int_handler}
+    previous = {signum: signal.getsignal(signum) for signum in handlers}
+    try:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
-def test_child_signal_exit_uses_shell_status(tmp_path, signum):
+def test_child_signal_exit_uses_shell_status(tmp_path, signum, default_signals):
     assert run_program([sys.executable, "-c", f"import os; os.kill(os.getpid(), {int(signum)})"], tmp_path) == 128 + signum
 
 
@@ -27,7 +41,7 @@ def test_child_signal_exit_uses_shell_status(tmp_path, signum):
     (signal.SIGINT, False, 130), (signal.SIGTERM, True, 137),
     (signal.SIGKILL, False, -signal.SIGKILL),
 ])
-def test_wrapper_cancellation_and_surviving_child_lease(tmp_path, signum, ignore, expected):
+def test_wrapper_cancellation_and_surviving_child_lease(tmp_path, signum, ignore, expected, default_signals):
     cache = materialize_model_cache(make_model_dir(tmp_path / "model"), base_dir=tmp_path / "state")
     marker = tmp_path / "child.pid"
     code = (
