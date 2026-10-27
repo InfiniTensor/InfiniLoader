@@ -2,74 +2,108 @@
 
 [English](README.md)
 
-InfiniLoader 把模型文件保存在长期运行的缓存进程中，让推理引擎反复重启时复用权重，减少对原始存储的重复读取。它是 Linux 用户态缓存，负责权重文件及其生命周期；模型计算和请求调度由推理引擎承担。
+面向 Linux 的模型文件缓存。将模型文件载入后台内存缓存后，可以在推理进程多次
+重启之间复用，通过普通文件接口读取；兼容的加载器无需修改框架源码。
 
-核心仅依赖 Python 标准库。选中的文件被复制到封存的 memfd，并通过指向 `/proc/<daemon-pid>/fd/<fd>` 的目录链接供现有文件加载器读取。
+## 安装
 
-## 安装与环境检查
-
-需要 Linux 和 Python 3.10+。建议安装在引擎所在环境，与消费者使用相同用户和 PID namespace：
+要求 Linux 和 Python 3.10+。在本仓库目录中安装到推理环境，推理框架需另外安装。
 
 ```bash
 python3 -m pip install .
 iloader doctor
-iloader selftest
 ```
 
-开发时可以使用 `source env.sh`，直接加载源码并启用 Bash 补全。运行目录应位于节点本地，并支持文件锁、Unix socket 和硬链接；`doctor` 会检查这些能力。
+## 快速开始
 
-## 加载一次，重复使用
+先从已有的本地模型目录创建缓存：
 
 ```bash
-MODEL=/absolute/path/to/model
-iloader start "$MODEL" --name dev
-iloader status dev
-
-# 示例：已安装 vLLM 时使用；仍需验证实际引擎版本。
-iloader run dev -- vllm serve '{model}' --tensor-parallel-size 1
-
-# 引擎退出后缓存继续保留，可重复运行。
-iloader run dev -- vllm serve '{model}' --tensor-parallel-size 1
-iloader stop dev --remove-view
+iloader start /models/Qwen3-8B --name qwen
 ```
 
-`run` 替换参数中的字面量 `{model}`，并设置 `ILOADER_MODEL_PATH`。消费者前台运行期间有租约保护。InfiniLoader 选项放在缓存名之前；消费者应在其 worker 需要读取 view 时保持存活。`stop` 等待原 daemon 退出，超时则返回错误。
+将 `/models/Qwen3-8B` 换成你的模型目录。`qwen` 是你为缓存起的名字。
+命令等待缓存就绪后返回；推理进程退出后，缓存仍然保留。
 
-文件接口是集成边界。引擎格式、单文件路径解析、容器和加载器行为都可能影响兼容性，必须验证实际版本。目前 CI 覆盖缓存服务与参考示例，没有覆盖按版本维护的 vLLM/SGLang/InfiniLM 兼容矩阵。
+### 启动推理引擎
 
-## 磁盘缓存与内存限制
+选择已安装且支持该模型的引擎。在原命令前加上 `iloader run qwen --`，
+把模型路径替换为 **`'{model}'`**，其他引擎参数原样保留。
+`'{model}'` 直接照抄，InfiniLoader 会自动将它填成缓存路径。
 
-仅使用本地磁盘代际，不额外分配整份模型大小的 RAM：
+**InfiniLM**：在你的 [InfiniLM 仓库](https://github.com/InfiniTensor/InfiniLM)中运行：
 
 ```bash
-LOCAL=$(iloader cache "$MODEL" --name dev)
-iloader verify "$LOCAL"
-iloader run --cache-path "$LOCAL" -- vllm serve '{model}'
+cd /absolute/path/to/InfiniLM
+iloader run qwen -- python3 python/infinilm/server/inference_server.py \
+  --model '{model}' --device nvidia --tp 1 --host 127.0.0.1 --port 8000
 ```
 
-需要从本地代际继续预加载到 RAM 时，使用 `start --local-cache`。磁盘缓存根目录必须位于源模型目录之外。
+将 `cd` 路径换成实际仓库路径，`--device` 按硬件调整。
+
+**vLLM：**
 
 ```bash
-iloader start "$MODEL" --name dev --local-cache \
-  --max-memory-bytes 32GiB --reserve-bytes 4GiB --max-resident-bytes 64GiB
-iloader gc --resident --max-bytes 32GiB          # 仅预览
-iloader gc --resident --max-bytes 32GiB --apply
+iloader run qwen -- vllm serve '{model}' \
+  --tensor-parallel-size 1 --host 127.0.0.1 --port 8000
 ```
 
-上述容量只是示例，应按模型和引擎实际占用设置。缓存计费包括文件内容与加载缓冲，引擎分配和客户端仍持有的映射/COW 副本另计。memfd 已封存但未 mlock，内存压力和 swap 仍会影响延迟。
+**SGLang：**
 
-源模型应使用不可变版本。源变化后需更换缓存名或先停止再重建。直接使用 `iloader view dev` 路径的读者没有自动租约，应保持自动 idle eviction 关闭。
+```bash
+iloader run qwen -- python3 -m sglang.launch_server --model-path '{model}' \
+  --tp 1 --host 127.0.0.1 --port 30000
+```
 
-## 文档与可选接口
+重复执行所选命令即可复用缓存。`run` 在前台子进程运行期间持有租约，防止缓存被
+正常回收或停止；只要工作进程仍需读取文件，就应保持这个前台子进程存活。
+请按实际环境验证框架版本兼容性，上述示例不代表完整兼容矩阵。
 
-- [操作、校验、回收与容器](docs/operations.md)
-- [贡献与测试](CONTRIBUTING.md)
-- [可选分片、TensorStore 和专家示例](docs/distributed.md)
-- [围绕缓存目标的开发范围](docs/roadmap.zh-CN.md)
-- [历史测量与维护资料](docs/archive/README.md)
+### 直接使用已有启动命令
 
-TensorStore、显式 TP/PP layout 和 GPU 专家池是实验接口，使用可选 PyTorch 依赖。参考 MLP/MoE 验证基本数值行为，不提供生产模型适配器、量化内核或 serving engine；核心 `start/run` 不需要这些接口。
+也可以取得缓存目录，直接传给引擎，不经过 `iloader run`：
 
-完整 CLI 以 `iloader --help` 和 `iloader COMMAND --help` 为准。常用核心命令为 `start`、`run`、`status`、`list`、`stop`、`cache`、`verify`、`gc`、`doctor` 和 `bench`。`bench` 不清除 OS page cache，仅测文件读取，不能等同于引擎启动收益。
+```bash
+VIEW=$(iloader view qwen)
+vllm serve "$VIEW" --tensor-parallel-size 1 --port 8000
+```
 
-[MIT 许可](LICENSE)。
+InfiniLM 对应 `--model "$VIEW"`，SGLang 对应 `--model-path "$VIEW"`。
+直接启动没有自动租约：保持空闲回收关闭，读取期间不要停止或回收缓存。
+原始磁盘路径不会自动转向缓存，当前也没有引擎原生参数用于启用 InfiniLoader。
+
+### 管理缓存
+
+```bash
+iloader status qwen
+iloader list
+# 所有读取方退出后，释放内存并移除缓存视图。
+iloader stop qwen --remove-view
+```
+
+停止缓存不会删除原始模型文件。缓存进程和读取方须使用同一用户及 PID 命名空间，
+容器配置见[运维说明](docs/operations.md)。
+
+## 分布式使用（实验性）
+
+多节点场景需要在每个节点运行缓存。实验性的 `iloader shard` 命令支持按
+**显式 TP/PP 布局**导出各 rank 的权重分片；张量切分规则、文件分发和各节点缓存
+启动需要使用者安排，尚未提供自动跨机部署。导出的格式需要相应模型适配器，
+不能直接替换上面框架示例中的原生模型目录。详见[分布式用法](docs/distributed.md#deployment-boundary)。
+
+## 性能
+
+缓存减少对来源存储的重复读取，但需要预载时间和内存。系统页缓存已经热时，额外
+缓存的加速收益可能很小。框架初始化和 CPU 到 GPU 的传输仍有开销，应结合缓存
+准备成本，测量自己环境中的完整工作流。
+
+## 文档
+
+- [使用指南与 CLI 参数](docs/usage.zh-CN.md)：完整命令对照、`start` 参数、内存预算和磁盘缓存。
+- [运维说明](docs/operations.md)：校验、回收及容器配置。
+- [参与开发](CONTRIBUTING.md)：开发环境与测试。
+- [实验 API](docs/distributed.md)：可选的张量分片、TensorStore 和专家示例。
+
+命令帮助：`iloader --help` 或 `iloader COMMAND --help`。
+
+[MIT 许可证](LICENSE)。

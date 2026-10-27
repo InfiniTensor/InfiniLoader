@@ -32,6 +32,23 @@ and [KTransformers' CPU/GPU heterogeneous expert placement](https://github.com/k
 The policy choices above are our interpretation of those workloads, not a claim
 that these engines consume the new InfiniLoader shard format directly.
 
+## Deployment boundary
+
+`iloader shard` prepares rank-specific files on the machine where it runs. It
+does not infer a model's tensor layout, assign ranks to hosts, transfer files or
+launch remote caches. A multi-node deployment currently needs these explicit steps:
+
+1. Define a TP/PP layout covering every tensor, then build and validate a plan.
+2. Export each required global rank. Copy each export to the node that will use it;
+   follow the publication/link-copy rules below so the copied rank is self-contained.
+3. Start node-local caches for the shards needed on that node, and run a model
+   adapter that consumes the explicit layout with the appropriate collectives.
+
+Alternatively, keep a full checkpoint cache per node and let the inference engine
+perform its own partitioning. Adding an engine's TP/PP flags does not ask
+InfiniLoader to prepare or distribute shards. Local `/proc` views are not remote
+file servers. The commands below demonstrate shard preparation, not host placement.
+
 ## Explicit checkpoint preparation
 
 The legacy `dist-plan` remains a heuristic report. It shares strict format and

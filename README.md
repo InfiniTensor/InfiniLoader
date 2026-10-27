@@ -1,100 +1,117 @@
 # InfiniLoader
 
-[中文说明](README.zh-CN.md)
+[中文](README.zh-CN.md)
 
-InfiniLoader keeps model files in a long-lived cache so inference-engine processes
-can restart without fetching the same weights from their original storage again.
-It is a Linux userspace cache: it does not implement model execution or request scheduling.
+A reusable model-file cache for Linux. Load a checkpoint into a background memory
+cache, then reuse it across inference-process restarts through ordinary file reads.
+Compatible loaders need no framework source-code changes.
 
-The core uses Python's standard library. It copies selected files into sealed
-`memfd` objects and exposes a directory of links to `/proc/<daemon-pid>/fd/<fd>`.
-Consumers keep their existing file loaders and use the published directory as the model path.
+## Installation
 
-## Install and check the environment
-
-Linux and Python 3.10+ are required. Install inside the engine's environment, using
-the same user and PID namespace as the consumer:
+Requires Linux and Python 3.10+. From this repository, install into your inference
+environment. Install the inference framework separately.
 
 ```bash
 python3 -m pip install .
 iloader doctor
-iloader selftest
 ```
 
-For development, `source env.sh` exposes the checkout without installing it and
-enables Bash completion. The runtime directory must be node-local and support file
-locks, Unix sockets and hard links; `doctor` checks these capabilities.
+## Quick start
 
-## Cache once and reuse
+Prepare a cache from an existing local model directory:
 
 ```bash
-MODEL=/absolute/path/to/model
-iloader start "$MODEL" --name dev
-iloader status dev
-
-# Example when vLLM is already installed; validate your engine version.
-iloader run dev -- vllm serve '{model}' --tensor-parallel-size 1
-
-# After the engine exits, the cache remains available for another run.
-iloader run dev -- vllm serve '{model}' --tensor-parallel-size 1
-iloader stop dev --remove-view
+iloader start /models/Qwen3-8B --name qwen
 ```
 
-`run` replaces the literal `{model}` argument and sets `ILOADER_MODEL_PATH`.
-It holds a lease while the foreground consumer runs. Put InfiniLoader options
-before the cache name, and keep the consumer alive while its workers need the view.
-`stop` waits for the original daemon to exit, or returns an error on timeout.
+Replace `/models/Qwen3-8B` with your model directory. `qwen` is a cache name you
+choose. The command waits until the cache is ready; it stays available after an
+inference process exits.
 
-The file interface is the integration boundary. Engine-specific formats, individual
-file-path resolution, containers and loader behavior can affect compatibility;
-test your actual engine. Current CI exercises the cache service and reference
-examples, not a versioned vLLM/SGLang/InfiniLM compatibility matrix.
+### Start an inference engine
 
-## Disk caching and memory limits
+Choose an installed engine that supports your checkpoint. Add `iloader run qwen --`
+before its command and replace the model path with **`'{model}'`**, literally as
+written. InfiniLoader fills in the cache path; keep all other engine arguments.
 
-For a reusable local disk generation without another model-sized RAM allocation:
+**InfiniLM** — run from your [InfiniLM checkout](https://github.com/InfiniTensor/InfiniLM):
 
 ```bash
-LOCAL=$(iloader cache "$MODEL" --name dev)
-iloader verify "$LOCAL"
-iloader run --cache-path "$LOCAL" -- vllm serve '{model}'
+cd /absolute/path/to/InfiniLM
+iloader run qwen -- python3 python/infinilm/server/inference_server.py \
+  --model '{model}' --device nvidia --tp 1 --host 127.0.0.1 --port 8000
 ```
 
-To preload into RAM from the local generation, use `start --local-cache`.
-The disk-cache root must be outside the source model directory.
+Replace the `cd` path with your checkout; adjust `--device` for your hardware.
+
+**vLLM:**
 
 ```bash
-iloader start "$MODEL" --name dev --local-cache \
-  --max-memory-bytes 32GiB --reserve-bytes 4GiB --max-resident-bytes 64GiB
-iloader gc --resident --max-bytes 32GiB          # preview only
-iloader gc --resident --max-bytes 32GiB --apply
+iloader run qwen -- vllm serve '{model}' \
+  --tensor-parallel-size 1 --host 127.0.0.1 --port 8000
 ```
 
-The limits above are examples; size them for the model and engine. The cache holds
-selected file bytes plus loading buffers. Engine allocations and client-held
-mappings/COW copies are additional. Sealed memfd pages are immutable but are not
-mlocked, so memory pressure and swap can affect latency.
+**SGLang:**
 
-Use immutable model revisions. A changed source requires a new cache name or an
-explicit stop/rebuild. Readers launched directly against `iloader view dev` have
-no automatic lease; keep idle eviction disabled for those readers.
+```bash
+iloader run qwen -- python3 -m sglang.launch_server --model-path '{model}' \
+  --tp 1 --host 127.0.0.1 --port 30000
+```
 
-## Documentation and optional APIs
+Repeat your chosen command to reuse the cache. `run` holds a lease while its
+foreground child runs, protecting the cache from normal eviction and stopping.
+Keep that child alive while its workers need the files. Engine-version support
+must be checked in your environment; these examples are not a compatibility matrix.
 
-- [Operations, verification, cleanup and containers](docs/operations.md)
-- [Contributing and running tests](CONTRIBUTING.md)
-- [Optional tensor sharding, TensorStore and expert examples](docs/distributed.md)
-- [Cache-focused development scope](docs/roadmap.zh-CN.md)
-- [Historical measurements and maintenance archive](docs/archive/README.md)
+### Use an existing launch command directly
 
-TensorStore, explicit TP/PP layouts and the GPU expert pool are experimental APIs
-with optional PyTorch dependencies. The reference MLP/MoE checks numerical behavior;
-it does not provide a production model adapter, quantized kernel or serving engine.
-They are not needed for the core `start/run` cache path.
+You can also pass the published cache path without using `iloader run`:
 
-Run `iloader --help` and `iloader COMMAND --help` for the complete CLI. Typical core
-commands are `start`, `run`, `status`, `list`, `stop`, `cache`, `verify`, `gc`, `doctor`
-and `bench`. `bench` measures file reads without clearing the OS page cache;
-it does not measure end-to-end engine startup.
+```bash
+VIEW=$(iloader view qwen)
+vllm serve "$VIEW" --tensor-parallel-size 1 --port 8000
+```
+
+For InfiniLM use `--model "$VIEW"`; for SGLang use `--model-path "$VIEW"`.
+Direct launches have no automatic lease: leave idle eviction disabled and do not
+stop or collect the cache while readers are active. The original disk path is not
+redirected automatically, and there is no native engine flag to enable InfiniLoader.
+
+### Manage the cache
+
+```bash
+iloader status qwen
+iloader list
+# After all readers have exited, release memory and remove the cache view.
+iloader stop qwen --remove-view
+```
+
+Stopping the cache leaves the source model files intact. The daemon and readers
+must use the same user and PID namespace; see [container setup](docs/operations.md).
+
+## Distributed use (experimental)
+
+Run a cache on each node for multi-node workloads. Experimental `iloader shard`
+commands export per-rank weights from an **explicit TP/PP layout**; users specify
+the tensor partition rules, distribute the exported files and start local caches.
+This is not automatic cross-node deployment. The exported format needs a model
+adapter; it is not a drop-in checkpoint for the engine commands above.
+See [distributed usage](docs/distributed.md#deployment-boundary).
+
+## Performance
+
+Caching avoids repeated reads from the source storage, but costs preload time and
+memory. When the OS page cache is already warm, an additional cache may offer little
+speed benefit. Framework initialization and CPU-to-GPU transfers still take time;
+measure the complete workload, including preparation, for your environment.
+
+## Documentation
+
+- [Usage guide and CLI reference](docs/usage.md) — command comparisons, every `start` option, memory budgets and disk caching.
+- [Operations](docs/operations.md) — verification, cleanup and containers.
+- [Contributing](CONTRIBUTING.md) — development setup and tests.
+- [Experimental APIs](docs/distributed.md) — optional tensor sharding, TensorStore and expert examples.
+
+For command help, use `iloader --help` or `iloader COMMAND --help`.
 
 [MIT license](LICENSE).
