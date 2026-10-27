@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import shutil
 import subprocess
 import sys
@@ -11,14 +10,18 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import __version__
+from .arguments import build_parser as argument_parser
+from .completion import bash_completion
 from .benchmark import benchmark_path
-from .cache import DEFAULT_EXCLUDES, build_view, human_bytes, inspect_source, load_model_into_memory
+from .cache import DEFAULT_EXCLUDES, build_view, human_bytes, inspect_source, load_model_into_memory, source_identity, _safe_remove_view
+from .runtime import FileLock, process_matches, process_token, read_json, signal_owned_process, validate_name, validate_socket_path
+from .runner import run_program as _run_program
 from .daemon import WeightLoaderDaemon
 from .distributed import build_tp_plan, create_rank_views, simulate_distributed_read
-from .ipc import LoaderConnectionError, request
-from .local_cache import cache_status, list_model_caches, materialize_model_cache
+from .ipc import LoaderConnectionError, LoaderStoppingError, request
+from .local_cache import cache_status, list_model_caches, materialize_model_cache, verify_cache, garbage_collect, lease_path, touch_cache
 from .paths import (
+    absolute_path,
     default_log_path,
     default_pid_path,
     default_socket_path,
@@ -39,19 +42,19 @@ def _print_json(data: object) -> None:
 
 
 def _socket(args: argparse.Namespace) -> Path:
-    return Path(args.socket).expanduser() if getattr(args, "socket", None) else default_socket_path(args.name, getattr(args, "base_dir", None))
+    return absolute_path(args.socket) if getattr(args, "socket", None) else default_socket_path(args.name, getattr(args, "base_dir", None))
 
 
 def _pid(args: argparse.Namespace) -> Path:
-    return Path(args.pid_file).expanduser() if getattr(args, "pid_file", None) else default_pid_path(args.name, getattr(args, "base_dir", None))
+    return absolute_path(args.pid_file) if getattr(args, "pid_file", None) else default_pid_path(args.name, getattr(args, "base_dir", None))
 
 
 def _state(args: argparse.Namespace) -> Path:
-    return Path(args.state_file).expanduser() if getattr(args, "state_file", None) else default_state_path(args.name, getattr(args, "base_dir", None))
+    return absolute_path(args.state_file) if getattr(args, "state_file", None) else default_state_path(args.name, getattr(args, "base_dir", None))
 
 
 def _view(args: argparse.Namespace) -> Path:
-    return Path(args.view).expanduser() if getattr(args, "view", None) else default_view_path(args.name, getattr(args, "base_dir", None))
+    return absolute_path(args.view) if getattr(args, "view", None) else default_view_path(args.name, getattr(args, "base_dir", None))
 
 
 def _resolve_name(args: argparse.Namespace) -> str:
@@ -106,14 +109,13 @@ def _starting_status(args: argparse.Namespace, error: Exception) -> dict | None:
         result.update(state)
         result["state"] = state.get("state") or "starting"
         result["pid"] = pid
+    if not state or not process_matches(pid, state.get("process_token")):
+        return None
     return result
 
 
 def _load_state(path: Path) -> dict | None:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    return read_json(path)
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -234,6 +236,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
         chunk_size=args.chunk_size,
         workers=args.workers,
         quiet=args.quiet,
+        identity=json.loads(args.identity) if getattr(args, "identity", None) else None,
+        max_memory_bytes=args.max_memory_bytes,
+        reserve_bytes=args.reserve_bytes,
+        max_resident_bytes=args.max_resident_bytes,
+        idle_ttl=args.idle_ttl,
     )
     return daemon.serve_forever()
 
@@ -274,80 +281,114 @@ def _daemon_command(args: argparse.Namespace, model_path: Path | None = None, up
         command.extend(["--exclude", pattern])
     if args.force:
         command.append("--force")
+    command.extend(["--identity", json.dumps(args.identity, sort_keys=True)])
+    command.extend(["--reserve-bytes", str(args.reserve_bytes)])
+    for option in ("max_memory_bytes", "max_resident_bytes"):
+        if getattr(args, option, None) is not None:
+            command.extend(["--" + option.replace("_", "-"), str(getattr(args, option))])
+    if args.idle_ttl is not None:
+        command.extend(["--idle-ttl", str(args.idle_ttl)])
     return command
 
 
 def cmd_start(args: argparse.Namespace) -> int:
+    validate_socket_path(_socket(args))
+    args.identity = source_identity(Path(args.model), _patterns(args.pattern), tuple(args.exclude or DEFAULT_EXCLUDES))
+    with FileLock(_socket(args).with_suffix(".start.lock"), timeout=args.wait_timeout):
+        return _start_locked(args)
+
+
+def _require_identity(args: argparse.Namespace, status: dict) -> None:
+    if status.get("identity") != args.identity:
+        raise RuntimeError("name already belongs to a different model, revision or file selection; use another name or stop it first")
+    if args.view and Path(status["view"]).absolute() != Path(args.view).expanduser().absolute():
+        raise RuntimeError("name already belongs to a different view path")
+    if args.refresh_cache:
+        raise RuntimeError("stop the running cache before requesting --refresh-cache")
+    if args.idle_ttl is not None and status.get("idle_ttl") != args.idle_ttl:
+        raise RuntimeError("stop the running cache before changing --idle-ttl")
+    for option in ("max_memory_bytes", "max_resident_bytes"):
+        requested = getattr(args, option, None)
+        if requested is not None and (status.get("memory_budget") or {}).get(option) != requested:
+            raise RuntimeError(f"stop the running cache before changing --{option.replace('_', '-')}")
+
+
+def _start_locked(args: argparse.Namespace) -> int:
     sock = _socket(args)
-    try:
-        status = request(sock, {"command": "status"}, timeout=1.0)["status"]
-        print(status["view"])
-        print(f"already running: name={args.name} pid={status['pid']}", file=sys.stderr)
-        return 0
-    except Exception:
-        pass
-
-    source, upstream_source, local_cache_path = _prepare_model_source(args)
-    log_path = Path(args.log_file).expanduser() if args.log_file else default_log_path(args.name, getattr(args, "base_dir", None))
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log = log_path.open("ab", buffering=0)
-    proc = subprocess.Popen(
-        _daemon_command(args, source, upstream_source, local_cache_path),
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
-    pid_path = _pid(args)
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(str(proc.pid), encoding="utf-8")
-    state_path = _state(args)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(
-        json.dumps(
-            {
-                "name": args.name,
-                "pid": proc.pid,
-                "state": "starting",
-                "view": str(_view(args)),
-                "socket": str(_socket(args)),
-                "log": str(log_path),
-                "started_at": time.time(),
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    print(f"starting name={args.name} pid={proc.pid} log={log_path}", file=sys.stderr)
-    if args.no_wait:
-        print(_view(args))
-        return 0
-
-    deadline = time.time() + args.wait_timeout
-    last_progress = None
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            if sys.stderr.isatty() and last_progress:
-                print(file=sys.stderr)
-            print(f"daemon exited with code {proc.returncode}; see {log_path}", file=sys.stderr)
-            return proc.returncode or 1
+    deadline = time.monotonic() + args.wait_timeout
+    while True:
         try:
             status = request(sock, {"command": "status"}, timeout=1.0)["status"]
-            last_progress = _print_progress_update(args, last_progress)
-            if sys.stderr.isatty() and last_progress:
-                print(file=sys.stderr)
+        except LoaderConnectionError:
+            status = None
+        starting = _starting_status(args, LoaderConnectionError("not ready")) if status is None else None
+        current = status or starting
+        if current and current.get("state") == "stopping":
+            if time.monotonic() >= deadline:
+                raise TimeoutError("previous daemon is still stopping; retry after it exits")
+            time.sleep(.05)
+            continue
+        if status is not None:
+            _require_identity(args, status)
+            try:
+                request(sock, {"command": "touch"})
+            except (LoaderConnectionError, LoaderStoppingError) as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("daemon stopped while opening the cache; retry") from exc
+                time.sleep(.05)
+                continue
             print(status["view"])
+            print(f"already running: name={args.name} pid={status['pid']}", file=sys.stderr)
             return 0
-        except Exception:
+        break
+    proc = None
+    if starting:
+        _require_identity(args, starting)
+        if args.no_wait:
+            print(starting["view"])
+            return 0
+    else:
+        with FileLock(sock.with_suffix(".owner.lock"), timeout=max(0, deadline - time.monotonic())):
+            pass  # A stopping owner can still be finishing cleanup after removing its metadata.
+        source, upstream_source, local_cache_path = _prepare_model_source(args)
+        if source_identity(Path(args.model), _patterns(args.pattern), tuple(args.exclude or DEFAULT_EXCLUDES)) != args.identity:
+            raise RuntimeError("source model changed while preparing local cache; retry")
+        log_path = Path(args.log_file).expanduser() if args.log_file else default_log_path(args.name, getattr(args, "base_dir", None))
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("ab", buffering=0) as log:
+            proc = subprocess.Popen(
+                _daemon_command(args, source, upstream_source, local_cache_path),
+                stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                start_new_session=True, close_fds=True,
+            )
+        deadline = time.monotonic() + args.wait_timeout
+        print(f"starting name={args.name} pid={proc.pid} log={log_path}", file=sys.stderr)
+
+    last_progress = None
+    while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(f"daemon exited with code {proc.returncode}; see {log_path}")
+        if args.no_wait:
+            registered = _starting_status(args, LoaderConnectionError("not ready"))
+            if registered and registered["pid"] == proc.pid:
+                _require_identity(args, registered)
+                print(registered["view"])
+                return 0
+        try:
+            status = request(sock, {"command": "status"}, timeout=1.0)["status"]
+        except LoaderConnectionError:
             last_progress = _print_progress_update(args, last_progress)
-            time.sleep(1.0)
-    if sys.stderr.isatty() and last_progress:
-        print(file=sys.stderr)
-    print(f"timeout waiting for daemon readiness; pid={proc.pid} log={log_path}", file=sys.stderr)
-    print(_view(args))
-    return 2
+            if proc is None and not _starting_status(args, LoaderConnectionError("not ready")):
+                raise RuntimeError("daemon exited before becoming ready")
+            time.sleep(0.1)
+            continue
+        _require_identity(args, status)
+        request(sock, {"command": "touch"})
+        if sys.stderr.isatty() and last_progress:
+            print(file=sys.stderr)
+        print(status["view"])
+        return 0
+    raise TimeoutError("timeout waiting for daemon readiness; inspect status and log before retrying")
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -392,6 +433,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         if status.get("load_seconds") is not None:
             print(f"load:   {status['load_seconds']:.3f}s")
         print(f"uptime: {status['uptime_seconds']:.1f}s")
+        print(f"leases: {status.get('active_leases', 0)}; reuse requests: {status.get('reuse_requests', 0)}")
+        print(f"sealed: {status.get('sealed', False)}; physical residency guaranteed: {status.get('physical_residency_guaranteed', False)}")
     return 0
 
 
@@ -414,7 +457,7 @@ def _status_for_name(name: str, args: argparse.Namespace) -> dict:
     )
     try:
         status = request(_socket(ns), {"command": "status"}, timeout=ns.timeout)["status"]
-        status["state"] = "ready"
+        status.setdefault("state", "ready")
         return status
     except LoaderConnectionError as exc:
         starting = _starting_status(ns, exc)
@@ -465,20 +508,39 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _wait_for_exit(pid: int, token: str, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while process_matches(pid, token):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("daemon is still stopping; view was preserved, retry after it exits")
+        time.sleep(.05)
+
+
 def _stop_one(args: argparse.Namespace) -> int:
     _resolve_name(args)
     try:
-        response = request(_socket(args), {"command": "stop", "remove_view": args.remove_view}, timeout=args.timeout)
-        print(f"{args.name}: {'stopping' if response.get('stopping') else 'ok'}")
+        response = request(_socket(args), {"command": "stop", "remove_view": args.remove_view,
+                                          "force": getattr(args, "force", False)}, timeout=args.timeout)
+        pid, token = response.get("pid"), response.get("process_token")
+        if pid is not None and token is not None:
+            _wait_for_exit(int(pid), token, args.timeout)
+            print(f"{args.name}: stopped")
+        else:
+            print(f"{args.name}: {'stopping' if response.get('stopping') else 'ok'}")
         return 0
     except LoaderConnectionError as exc:
         starting = _starting_status(args, exc)
         if not starting:
             print(f"{args.name}: {exc}", file=sys.stderr)
             return 1
-        os.kill(int(starting["pid"]), signal.SIGTERM)
+        if starting.get("state") not in ("starting", "loading", "loaded") and not getattr(args, "force", False):
+            raise RuntimeError("ready daemon is unresponsive; no signal was sent, retry or use stop --force")
+        signal_owned_process(int(starting["pid"]), starting.get("process_token"))
+        _wait_for_exit(int(starting["pid"]), starting.get("process_token"), args.timeout)
         if args.remove_view:
-            shutil.rmtree(_view(args), ignore_errors=True)
+            view = Path(starting["view"])
+            if view.exists():
+                _safe_remove_view(view, expected_pid=int(starting["pid"]))
         print(f"{args.name}: stopping pid={starting['pid']}")
         return 0
 
@@ -504,8 +566,13 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 view=None,
                 timeout=args.timeout,
                 remove_view=args.remove_view,
+                force=getattr(args, "force", False),
             )
-            rc = max(rc, _stop_one(ns))
+            try:
+                rc = max(rc, _stop_one(ns))
+            except (RuntimeError, OSError, ValueError) as exc:
+                print(f"{row['name']}: {exc}", file=sys.stderr)
+                rc = max(rc, 1)
         return rc
     return _stop_one(args)
 
@@ -580,83 +647,105 @@ def cmd_cache_list(args: argparse.Namespace) -> int:
     return 0
 
 
-BASH_COMPLETION = r'''_iloader_complete() {
-  local cur prev sub commands opts
-  COMPREPLY=()
-  cur="${COMP_WORDS[COMP_CWORD]}"
-  prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="inspect start list status view manifest stop bench selftest cache cache-status cache-list dist-views dist-simulate dist-plan completion"
+def cmd_verify(args: argparse.Namespace) -> int:
+    path = Path(args.path).expanduser().absolute()
+    with FileLock(lease_path(path), shared=True):
+        data = verify_cache(path, full=not args.quick)
+    if args.json:
+        _print_json(data)
+    else:
+        print(f"valid: {data['valid']} ({data['checked_files']} files)")
+        for error in data["errors"]:
+            print(error, file=sys.stderr)
+    return 0 if data["valid"] else 1
 
-  if [[ ${COMP_CWORD} -eq 1 ]]; then
-    COMPREPLY=( $(compgen -W "${commands}" -- "${cur}") )
-    return 0
-  fi
 
-  case "${prev}" in
-    --name)
-      COMPREPLY=( $(compgen -W "$(iloader list --names-only 2>/dev/null)" -- "${cur}") )
-      return 0
-      ;;
-    --device)
-      COMPREPLY=( $(compgen -W "cpu cuda cuda:0" -- "${cur}") )
-      return 0
-      ;;
-    --base-dir|--view|--cache-root|--log-file|--pid-file|--socket|--rank-view-root)
-      compopt -o filenames 2>/dev/null || true
-      COMPREPLY=( $(compgen -f -- "${cur}") )
-      return 0
-      ;;
-  esac
+def cmd_gc(args: argparse.Namespace) -> int:
+    if args.max_bytes is not None and args.max_bytes < 0 or args.ttl is not None and args.ttl < 0:
+        raise ValueError("max-bytes and ttl must be non-negative")
+    if args.resident and args.cache_root:
+        raise ValueError("--cache-root applies to disk caches; use --base-dir for resident caches")
+    data = _gc_resident(args) if args.resident else garbage_collect(
+        cache_root=args.cache_root, base_dir=args.base_dir,
+        max_bytes=args.max_bytes, ttl=args.ttl, apply=args.apply)
+    if args.json:
+        _print_json(data)
+    else:
+        print("removed:" if args.apply else "would remove:")
+        for row in data["candidates"]:
+            print(f"  {row['cache_path']} ({row['total_human']})")
+        for row in data["skipped"]:
+            print(f"  skipped: {row['cache_path']} ({row['reason']})")
+        print(f"remaining: {human_bytes(data['remaining_bytes'])}; budget met: {data['budget_met']}")
+    return 0 if data["budget_met"] else 1
 
-  sub="${COMP_WORDS[1]}"
-  case "${sub}" in
-    start)
-      opts="--name --view --socket --pid-file --base-dir --log-file --pattern --exclude --force --no-wait --wait-timeout --chunk-size --workers --max-memory-fraction --local-cache --cache-root --cache-name --refresh-cache --cache-workers --help"
-      ;;
-    list)
-      opts="--base-dir --timeout --json --names-only --help"
-      ;;
-    status|view|manifest)
-      opts="--name --socket --base-dir --timeout --json --help"
-      ;;
-    stop)
-      opts="--name --all --socket --base-dir --timeout --remove-view --help"
-      ;;
-    cache|cache-status)
-      opts="--name --cache-name --cache-root --base-dir --pattern --exclude --refresh --cache-workers --chunk-size --quiet --json --help"
-      ;;
-    cache-list)
-      opts="--cache-root --base-dir --json --help"
-      ;;
-    dist-views)
-      opts="--name --ranks --base-dir --replace --json --help"
-      ;;
-    dist-simulate)
-      opts="--ranks --rank-view-root --pattern --exclude --chunk-size --json --help"
-      ;;
-    dist-plan)
-      opts="--tp --limit --json --help"
-      ;;
-    completion)
-      opts="bash --help"
-      ;;
-    *)
-      opts="--help --json --base-dir --name"
-      ;;
-  esac
 
-  if [[ "${cur}" == -* ]]; then
-    COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-    return 0
-  fi
-}
-complete -F _iloader_complete iloader
-'''
+def _gc_resident(args: argparse.Namespace) -> dict:
+    rows = _active_daemon_rows(args)
+    total = sum(row.get("total_bytes", 0) for row in rows)
+    candidates, skipped = [], []
+    for row in sorted(rows, key=lambda r: r.get("last_used_at", float("inf"))):
+        expired = args.ttl is not None and time.time() - row.get("last_used_at", time.time()) >= args.ttl
+        if not expired and not (args.max_bytes is not None and total > args.max_bytes):
+            continue
+        if row.get("state") != "ready" or row.get("active_leases"):
+            skipped.append(dict(cache_path=row.get("view", row["name"]), reason="loading, unavailable or leased"))
+            continue
+        if args.apply:
+            try:
+                request(row["socket"], {"command": "evict", "last_used_at": row["last_used_at"], "remove_view": True})
+            except (LoaderConnectionError, RuntimeError) as exc:
+                skipped.append(dict(cache_path=row["view"], reason=str(exc)))
+                continue
+        candidates.append(dict(cache_path=row["view"], total_human=row["total_human"]))
+        total -= row["total_bytes"]
+    return dict(apply=args.apply, candidates=candidates, skipped=skipped, remaining_bytes=total,
+                budget_met=args.max_bytes is None or total <= args.max_bytes)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from .diagnostics import diagnose
+
+    data = diagnose(Path(args.base_dir) if args.base_dir else None)
+    if args.json:
+        _print_json(data)
+    else:
+        for check in data["checks"]:
+            print(f"{'ok' if check['ok'] else 'FAIL'}: {check['name']}: {check['detail']}")
+        print(f"effective memory headroom: {data['memory']['available_bytes']} bytes")
+        for warning in data["warnings"]:
+            print(f"note: {warning}")
+    return 0 if data["ok"] else 1
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    program = args.program[1:] if args.program[:1] == ["--"] else args.program
+    if args.cache_path and args.name_arg:
+        program = [args.name_arg] + program
+    if not program or not (args.name_arg or args.cache_path):
+        raise ValueError("use run NAME -- COMMAND ... or run --cache-path PATH -- COMMAND ...")
+    if args.cache_path:
+        path = Path(args.cache_path).expanduser().resolve()
+        with FileLock(lease_path(path), shared=True) as lease:
+            if not verify_cache(path, full=False)["valid"]:
+                raise RuntimeError("cache is missing or invalid; run verify or rebuild it")
+            touch_cache(path)
+            return _run_program(program, path, pass_fds=(lease.fd,))
+    args.name = _resolve_name(args)
+    sock = _socket(args)
+    lease = request(sock, {"command": "lease-acquire", "pid": os.getpid(), "process_token": process_token(os.getpid())})
+    try:
+        return _run_program(program, Path(lease["view"]), socket_path=sock, lease=lease["lease"])
+    finally:
+        try:
+            request(sock, {"command": "lease-release", "lease": lease["lease"]})
+        except (LoaderConnectionError, RuntimeError):
+            pass
 
 
 def cmd_completion(args: argparse.Namespace) -> int:
     if args.shell == "bash":
-        print(BASH_COMPLETION)
+        print(bash_completion(build_parser()))
         return 0
     raise ValueError(f"unsupported shell: {args.shell}")
 
@@ -690,6 +779,7 @@ def cmd_dist_simulate(args: argparse.Namespace) -> int:
         include_patterns=_patterns(args.pattern) or ("*.safetensors",),
         exclude_patterns=tuple(args.exclude or DEFAULT_EXCLUDES),
         chunk_size=args.chunk_size,
+        timeout=args.timeout,
     )
     if args.json:
         _print_json(result)
@@ -753,6 +843,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         for run in result["runs"]:
             print(f"run {run['run']}: {run['seconds']:.3f}s, {run['gib_per_second']:.3f} GiB/s")
         print(f"best:  {result['best_gib_per_second']:.3f} GiB/s")
+        print(f"median: {result['median_seconds']:.3f}s; cache state: {result['cache_state']}")
     return 0
 
 
@@ -789,181 +880,48 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    prog = Path(sys.argv[0]).name
-    if prog in {"__main__.py", "python", "python3"}:
-        prog = "iloader"
-    parser = argparse.ArgumentParser(prog=prog, description="InfiniLoader: LLM weight loading and residency manager")
-    parser.add_argument("--version", action="version", version=f"InfiniLoader {__version__}")
-    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
-
-    inspect_p = sub.add_parser("inspect", help="inspect selected files and memory budget")
-    inspect_p.add_argument("model")
-    inspect_p.add_argument("--pattern", action="append", help="include glob; can be repeated")
-    inspect_p.add_argument("--exclude", action="append", help="exclude glob; replaces defaults when provided")
-    inspect_p.add_argument("--json", action="store_true")
-    inspect_p.set_defaults(func=cmd_inspect)
-
-    serve_p = sub.add_parser("_serve", help=argparse.SUPPRESS)
-    serve_p.add_argument("model")
-    serve_p.add_argument("--name", required=True)
-    serve_p.add_argument("--view")
-    serve_p.add_argument("--socket")
-    serve_p.add_argument("--pid-file")
-    serve_p.add_argument("--state-file", help=argparse.SUPPRESS)
-    serve_p.add_argument("--base-dir")
-    serve_p.add_argument("--upstream-source", help=argparse.SUPPRESS)
-    serve_p.add_argument("--local-cache-path", help=argparse.SUPPRESS)
-    serve_p.add_argument("--pattern", action="append")
-    serve_p.add_argument("--exclude", action="append")
-    serve_p.add_argument("--replace", action="store_true")
-    serve_p.add_argument("--force", action="store_true")
-    serve_p.add_argument("--quiet", action="store_true")
-    serve_p.add_argument("--chunk-size", type=int, default=64 * 1024 * 1024)
-    serve_p.add_argument("--workers", type=int, default=1, help="parallel memfd preload workers")
-    serve_p.add_argument("--max-memory-fraction", type=float, default=0.90)
-    serve_p.add_argument("--local-cache", action="store_true", help="copy model to local cache before memfd preload")
-    serve_p.add_argument("--cache-root")
-    serve_p.add_argument("--cache-name")
-    serve_p.add_argument("--refresh-cache", action="store_true")
-    serve_p.add_argument("--cache-workers", type=int, default=4)
-    serve_p.set_defaults(func=cmd_serve)
-    sub._choices_actions = [action for action in sub._choices_actions if action.dest != "_serve"]
-
-    start_p = sub.add_parser("start", help="start background daemon")
-    start_p.add_argument("model")
-    start_p.add_argument("--name", required=True)
-    start_p.add_argument("--view")
-    start_p.add_argument("--socket")
-    start_p.add_argument("--pid-file")
-    start_p.add_argument("--base-dir")
-    start_p.add_argument("--log-file")
-    start_p.add_argument("--pattern", action="append")
-    start_p.add_argument("--exclude", action="append")
-    start_p.add_argument("--force", action="store_true")
-    start_p.add_argument("--no-wait", action="store_true")
-    start_p.add_argument("--wait-timeout", type=float, default=600.0)
-    start_p.add_argument("--chunk-size", type=int, default=64 * 1024 * 1024)
-    start_p.add_argument("--workers", type=int, default=1, help="parallel memfd preload workers")
-    start_p.add_argument("--max-memory-fraction", type=float, default=0.90)
-    start_p.add_argument("--local-cache", action="store_true", help="copy model to local cache before memfd preload")
-    start_p.add_argument("--cache-root")
-    start_p.add_argument("--cache-name")
-    start_p.add_argument("--refresh-cache", action="store_true")
-    start_p.add_argument("--cache-workers", type=int, default=4)
-    start_p.set_defaults(func=cmd_start)
-
-    cache_p = sub.add_parser("cache", help="materialize a local model cache")
-    cache_p.add_argument("model")
-    cache_p.add_argument("--name")
-    cache_p.add_argument("--cache-name")
-    cache_p.add_argument("--cache-root")
-    cache_p.add_argument("--base-dir")
-    cache_p.add_argument("--pattern", action="append")
-    cache_p.add_argument("--exclude", action="append")
-    cache_p.add_argument("--refresh", action="store_true")
-    cache_p.add_argument("--cache-workers", type=int, default=4)
-    cache_p.add_argument("--chunk-size", type=int, default=64 * 1024 * 1024)
-    cache_p.add_argument("--quiet", action="store_true")
-    cache_p.add_argument("--json", action="store_true")
-    cache_p.set_defaults(func=cmd_cache)
-
-    cache_status_p = sub.add_parser("cache-status", help="check whether a local model cache is valid")
-    cache_status_p.add_argument("model")
-    cache_status_p.add_argument("--name")
-    cache_status_p.add_argument("--cache-name")
-    cache_status_p.add_argument("--cache-root")
-    cache_status_p.add_argument("--base-dir")
-    cache_status_p.add_argument("--pattern", action="append")
-    cache_status_p.add_argument("--exclude", action="append")
-    cache_status_p.add_argument("--json", action="store_true")
-    cache_status_p.set_defaults(func=cmd_cache_status)
-
-    cache_list_p = sub.add_parser("cache-list", help="list local model caches")
-    cache_list_p.add_argument("--cache-root")
-    cache_list_p.add_argument("--base-dir")
-    cache_list_p.add_argument("--json", action="store_true")
-    cache_list_p.set_defaults(func=cmd_cache_list)
-
-    list_p = sub.add_parser("list", help="list active resident caches")
-    list_p.add_argument("--base-dir")
-    list_p.add_argument("--timeout", type=float, default=1.0)
-    list_p.add_argument("--json", action="store_true")
-    list_p.add_argument("--names-only", action="store_true", help=argparse.SUPPRESS)
-    list_p.set_defaults(func=cmd_list)
-
-    dist_views_p = sub.add_parser("dist-views", help="create full HF-compatible model views for simulated ranks")
-    dist_views_p.add_argument("model")
-    dist_views_p.add_argument("--name", required=True)
-    dist_views_p.add_argument("--ranks", type=int, required=True)
-    dist_views_p.add_argument("--base-dir")
-    dist_views_p.add_argument("--replace", action="store_true")
-    dist_views_p.add_argument("--json", action="store_true")
-    dist_views_p.set_defaults(func=cmd_dist_views)
-
-    dist_sim_p = sub.add_parser("dist-simulate", help="simulate concurrent multi-rank model reads on this host")
-    dist_sim_p.add_argument("model")
-    dist_sim_p.add_argument("--ranks", type=int, required=True)
-    dist_sim_p.add_argument("--rank-view-root", help="root containing rank0/rank1/... directories")
-    dist_sim_p.add_argument("--pattern", action="append")
-    dist_sim_p.add_argument("--exclude", action="append")
-    dist_sim_p.add_argument("--chunk-size", type=int, default=64 * 1024 * 1024)
-    dist_sim_p.add_argument("--json", action="store_true")
-    dist_sim_p.set_defaults(func=cmd_dist_simulate)
-
-    dist_plan_p = sub.add_parser("dist-plan", help="analyze safetensors metadata for TP split candidates")
-    dist_plan_p.add_argument("model")
-    dist_plan_p.add_argument("--tp", type=int, required=True)
-    dist_plan_p.add_argument("--limit", type=int, default=40)
-    dist_plan_p.add_argument("--json", action="store_true")
-    dist_plan_p.set_defaults(func=cmd_dist_plan)
-
-    for name, help_text, func in [
-        ("status", "show daemon status", cmd_status),
-        ("view", "print daemon view path", cmd_view),
-        ("manifest", "print daemon manifest", cmd_manifest),
-    ]:
-        p = sub.add_parser(name, help=help_text)
-        p.add_argument("name_arg", nargs="?")
-        p.add_argument("--name")
-        p.add_argument("--socket")
-        p.add_argument("--base-dir")
-        p.add_argument("--timeout", type=float, default=5.0)
-        if name in {"status"}:
-            p.add_argument("--json", action="store_true")
-        p.set_defaults(func=func)
-
-    stop_p = sub.add_parser("stop", help="stop daemon")
-    stop_p.add_argument("name_arg", nargs="?")
-    stop_p.add_argument("--name")
-    stop_p.add_argument("--all", action="store_true", help="stop every active resident cache in the run directory")
-    stop_p.add_argument("--socket")
-    stop_p.add_argument("--base-dir")
-    stop_p.add_argument("--timeout", type=float, default=5.0)
-    stop_p.add_argument("--remove-view", action="store_true")
-    stop_p.set_defaults(func=cmd_stop)
-
-    bench_p = sub.add_parser("bench", help="sequential read benchmark")
-    bench_p.add_argument("path")
-    bench_p.add_argument("--pattern", action="append")
-    bench_p.add_argument("--exclude", action="append")
-    bench_p.add_argument("--repeat", type=int, default=3)
-    bench_p.add_argument("--chunk-size", type=int, default=64 * 1024 * 1024)
-    bench_p.add_argument("--json", action="store_true")
-    bench_p.set_defaults(func=cmd_bench)
-
-    selftest_p = sub.add_parser("selftest", help="verify memfd view with open/stat/mmap")
-    selftest_p.set_defaults(func=cmd_selftest)
-
-    completion_p = sub.add_parser("completion", help="print shell completion script")
-    completion_p.add_argument("shell", choices=["bash"])
-    completion_p.set_defaults(func=cmd_completion)
-    return parser
+    return argument_parser({
+        "cmd_bench": cmd_bench,
+        "cmd_cache": cmd_cache,
+        "cmd_cache_list": cmd_cache_list,
+        "cmd_cache_status": cmd_cache_status,
+        "cmd_completion": cmd_completion,
+        "cmd_dist_plan": cmd_dist_plan,
+        "cmd_dist_simulate": cmd_dist_simulate,
+        "cmd_dist_views": cmd_dist_views,
+        "cmd_doctor": cmd_doctor,
+        "cmd_gc": cmd_gc,
+        "cmd_inspect": cmd_inspect,
+        "cmd_list": cmd_list,
+        "cmd_manifest": cmd_manifest,
+        "cmd_run": cmd_run,
+        "cmd_selftest": cmd_selftest,
+        "cmd_serve": cmd_serve,
+        "cmd_start": cmd_start,
+        "cmd_status": cmd_status,
+        "cmd_stop": cmd_stop,
+        "cmd_verify": cmd_verify,
+        "cmd_view": cmd_view,
+    })
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        for attribute in ("workers", "cache_workers", "chunk_size", "ranks", "tp", "repeat", "timeout", "wait_timeout"):
+            value = getattr(args, attribute, None)
+            if value is not None and value <= 0:
+                raise ValueError(f"{attribute} must be positive")
+        for attribute in ("name", "name_arg"):
+            if args.command == "run" and getattr(args, "cache_path", None) and attribute == "name_arg":
+                continue
+            if getattr(args, attribute, None):
+                validate_name(getattr(args, attribute))
+        for attribute in ("idle_ttl", "max_memory_bytes", "max_resident_bytes"):
+            value = getattr(args, attribute, None)
+            if value is not None and value <= 0:
+                raise ValueError(f"{attribute} must be positive")
         return int(args.func(args))
     except KeyboardInterrupt:
         return 130

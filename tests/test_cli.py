@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import pytest
 
 from conftest import make_model_dir
 from infiniloader.cli import build_parser, main
+from infiniloader.runtime import process_token
 
 
 def test_main_inspect_json_outputs_model_summary(tmp_path, capsys):
@@ -36,6 +38,7 @@ def test_status_reports_starting_when_pid_exists_without_socket(tmp_path, monkey
         json.dumps(
             {
                 "state": "loading",
+                "process_token": process_token(os.getpid()),
                 "copied_bytes": 5,
                 "total_bytes": 10,
                 "rate_bytes_per_second": 2,
@@ -60,6 +63,7 @@ def test_list_reports_active_starting_cache_name(tmp_path, monkeypatch, capsys):
     run_dir = tmp_path / "state" / "run"
     run_dir.mkdir(parents=True)
     (run_dir / "unit.pid").write_text(str(os.getpid()), encoding="utf-8")
+    (run_dir / "unit.state.json").write_text(json.dumps({"process_token": process_token(os.getpid())}))
 
     code = main(["list", "--base-dir", str(tmp_path / "state"), "--names-only"])
     captured = capsys.readouterr()
@@ -70,11 +74,19 @@ def test_list_reports_active_starting_cache_name(tmp_path, monkeypatch, capsys):
 
 def test_stop_all_can_stop_starting_daemon(tmp_path, monkeypatch, capsys):
     killed = []
+    alive = True
     monkeypatch.setattr("infiniloader.cli._pid_is_running", lambda _pid: True)
     monkeypatch.setattr("infiniloader.cli.os.kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr("infiniloader.cli.process_matches", lambda pid, token: alive)
+    def signal_exit(pid, token):
+        nonlocal alive
+        killed.append((pid, token))
+        alive = False
+    monkeypatch.setattr("infiniloader.cli.signal_owned_process", signal_exit)
     run_dir = tmp_path / "state" / "run"
     run_dir.mkdir(parents=True)
     (run_dir / "unit.pid").write_text("12345", encoding="utf-8")
+    (run_dir / "unit.state.json").write_text(json.dumps({"process_token": "test"}))
 
     code = main(["stop", "--all", "--base-dir", str(tmp_path / "state")])
     captured = capsys.readouterr()
@@ -82,6 +94,28 @@ def test_stop_all_can_stop_starting_daemon(tmp_path, monkeypatch, capsys):
     assert code == 0
     assert killed
     assert "unit: stopping pid=12345" in captured.out
+
+
+@pytest.mark.parametrize("state,force", [("loading", False), ("ready", True)])
+@pytest.mark.parametrize("remove_view", [False, True])
+def test_stop_fallback_waits_for_the_original_owner(tmp_path, monkeypatch, state, force, remove_view):
+    from infiniloader import cli
+    from infiniloader.ipc import LoaderConnectionError
+    events = []
+    def offline(*args, **kwargs):
+        raise LoaderConnectionError("socket unavailable")
+    monkeypatch.setattr(cli, "request", offline)
+    monkeypatch.setattr(cli, "_starting_status", lambda *_: dict(
+        state=state, pid=12345, process_token="original", view=str(tmp_path / "missing")))
+    monkeypatch.setattr(cli, "signal_owned_process", lambda pid, token: events.append(("signal", pid, token)))
+    monkeypatch.setattr(cli, "_wait_for_exit", lambda pid, token, timeout: events.append(("wait", pid, token)))
+    args = ["stop", "unit", "--base-dir", str(tmp_path)]
+    if force:
+        args.append("--force")
+    if remove_view:
+        args.append("--remove-view")
+    assert main(args) == 0
+    assert events == [("signal", 12345, "original"), ("wait", 12345, "original")]
 
 
 def test_completion_bash_outputs_completion_function(capsys):
